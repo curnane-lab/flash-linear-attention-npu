@@ -79,7 +79,8 @@ _ENUM = {
     "npu_chunk_gated_delta_rule_bwd": {"layout": _LAYOUT_CODES},
     "npu_chunk_local_cumsum": {"output_dtype": {"float32": 0,
                                                 "bfloat16": 1}},
-    "npu_solve_tri": {"layout": {"bsnd": 0, "bnsd": 1, "tnd": 2, "ntd": 3}},
+    "npu_solve_tri": {"layout": {"bsnd": 0, "bnsd": 1, "tnd": 2, "ntd": 3,
+                                 "bhtd": 4}},  # bhtd: bnsd 兼容别名（追加在末尾，既有索引是 ABI 不可移动）
 }
 
 
