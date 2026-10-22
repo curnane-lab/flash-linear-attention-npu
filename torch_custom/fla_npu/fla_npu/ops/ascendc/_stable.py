@@ -280,8 +280,10 @@ def _current_stream_ptr() -> int:
 # to bump its version counter afterwards.  That wrapper is two frames, a
 # resolved-mutation plan and a rebuilt tensor list on every call, and the host
 # bench charges ~8us per call for it on a decode path that walks these wrappers
-# some thirty times a step.  The four hot operators therefore apply the contract
-# in their own body and the dispatch layer skips its wrapper for them --
+# some thirty times a step.  The hot operators (and every other operator that
+# applies the contract in its own body, such as the GDN recover variant)
+# therefore carry the contract themselves and the dispatch layer skips its
+# wrapper for them --
 # `_fla_npu_inplace_contract` is the marker it reads (see
 # __init__._get_direct_op).  Which arguments are mutable is still declared once,
 # in __init__.MUTATED_ARGUMENTS: that table is what the ctypes path and
@@ -663,6 +665,10 @@ def npu_recurrent_gated_delta_rule_recover(
 
     if state is not None and state.requires_grad:
         _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", state)
+    if records is not None and records.requires_grad:
+        # records is mutated in place exactly like state (both are declared in
+        # __init__.MUTATED_ARGUMENTS), so it carries the same grad restriction.
+        _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", records)
     stream = _current_stream_ptr()
     op = _OP_CACHE.get("npu_recurrent_gated_delta_rule_recover")
     if op is None:
@@ -2142,15 +2148,19 @@ def npu_merge_fwd_bwd_kernel(
 # ---------------------------------------------------------------------------
 # Which wrappers apply the in-place contract themselves
 # ---------------------------------------------------------------------------
-# These four are the ones a decode step calls with a state argument.  Each
+# The first four are the ones a decode step calls with a state argument.  Each
 # refuses a grad-requiring state and bumps the version counter inside its own
 # frame, which is what __init__._get_direct_op reads this marker for: adding its
 # generic mutation wrapper on top would bump the counter twice for one call, so
-# exactly one side declares the contract for a given backend.
+# exactly one side declares the contract for a given backend.  The recover
+# variant of recurrent GDN is on the same footing: it refuses grad-requiring
+# state/records and bumps both counters in its own body (it is not decode-hot,
+# but an unmarked entry got the outer wrapper's bump on top of its own).
 for _contract_op in (
         "npu_causal_conv1d_fn",
         "npu_causal_conv1d_update",
         "npu_recurrent_gated_delta_rule",
+        "npu_recurrent_gated_delta_rule_recover",
         "npu_recurrent_kda"):
     globals()[_contract_op]._fla_npu_inplace_contract = True
 del _contract_op
