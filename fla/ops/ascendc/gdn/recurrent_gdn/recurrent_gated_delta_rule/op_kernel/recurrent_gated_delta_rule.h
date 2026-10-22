@@ -86,6 +86,10 @@ public:
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         hasSourceState_ = (tilingData->hasSourceState == 1);
         hasRecords_ = (tilingData->hasRecords == 1) && (tilingData->recordPackMode == RGDR_RECORD_PACK_FUSED);
+        // Records-only verify (R1 variant): out + records only, never a state
+        // write.  Only meaningful with records on; the host sets recordsOnly
+        // exclusively in that combination.
+        recordsOnly_ = (tilingData->recordsOnly == 1) && hasRecords_;
         recordStride0_ = tilingData->recordStride0;
         recordStride1_ = tilingData->recordStride1;
         recordStride2_ = tilingData->recordStride2;
@@ -146,7 +150,11 @@ public:
             pipe_->InitBuffer(gamaKInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(float));
         }
         pipe_->InitBuffer(betaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(inType));
-        pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, alignK_ * vStep_ * sizeof(stateType));
+        // recordsOnly: the whole state write path (queue alloc/enque/deque/free
+        // in Compute/CopyOutState) is skipped, so the queue is not allocated.
+        if (!recordsOnly_) {
+            pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, alignK_ * vStep_ * sizeof(stateType));
+        }
         pipe_->InitBuffer(attnOutQueue_, attnOutBufferNum_, vStep_ * sizeof(outType));
         if (hasRecords_) {
             // One rows-in-flight staging buffer: [dc(curSingleV) | k(realK) | alpha(1)].
@@ -467,14 +475,16 @@ private:
         MatVecMul(stateInUb, qInUb[curQKOffset], broadTmpInUb, curSingleV, false);
         AscendC::PipeBarrier<PIPE_V>();
         ReduceSumDispatch(attnInUb, broadTmpInUb, curSingleV);
-        LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
-        LocalTensor<outType> attnOutLocal = attnOutQueue_.AllocTensor<outType>();
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(stateOutLocal, stateInUb, alignK_ * curSingleV);
-        } else {
-            Cast(stateOutLocal, stateInUb, AscendC::RoundMode::CAST_RINT, alignK_ * curSingleV);
+        if (!recordsOnly_) {
+            LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
+            if constexpr (std::is_same<stateType, float32_t>()) {
+                DataCopy(stateOutLocal, stateInUb, alignK_ * curSingleV);
+            } else {
+                Cast(stateOutLocal, stateInUb, AscendC::RoundMode::CAST_RINT, alignK_ * curSingleV);
+            }
+            stateOutQueue_.EnQue<stateType>(stateOutLocal);
         }
-        stateOutQueue_.EnQue<stateType>(stateOutLocal);
+        LocalTensor<outType> attnOutLocal = attnOutQueue_.AllocTensor<outType>();
         Cast(attnOutLocal, attnInUb, AscendC::RoundMode::CAST_RINT, curSingleV);
         attnOutQueue_.EnQue<outType>(attnOutLocal);
     }
@@ -589,9 +599,6 @@ private:
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
-                uint64_t curStateOutOffset =
-                    static_cast<uint64_t>(stateStride0_) * ssmStateIndicesGm_.GetValue(seq_i) +
-                    stateStride1_ * head_i + stateStride2_ * v_i;
                 uint64_t curRecordOffset = 0;
                 if (hasRecords_) {
                     curRecordOffset =
@@ -613,14 +620,19 @@ private:
                     pendingAttnOffset = attnOffset;
                     hasPendingAttn = true;
                 }
-                if (stateOutBufferNum_ == BUFFER_NUM) {
-                    CopyOutState(curStateOutOffset, curSingleV);
-                } else {
-                    if (hasPendingState) {
-                        CopyOutState(pendingStateOffset, curSingleV);
+                if (!recordsOnly_) {
+                    uint64_t curStateOutOffset =
+                        static_cast<uint64_t>(stateStride0_) * ssmStateIndicesGm_.GetValue(seq_i) +
+                        stateStride1_ * head_i + stateStride2_ * v_i;
+                    if (stateOutBufferNum_ == BUFFER_NUM) {
+                        CopyOutState(curStateOutOffset, curSingleV);
+                    } else {
+                        if (hasPendingState) {
+                            CopyOutState(pendingStateOffset, curSingleV);
+                        }
+                        pendingStateOffset = curStateOutOffset;
+                        hasPendingState = true;
                     }
-                    pendingStateOffset = curStateOutOffset;
-                    hasPendingState = true;
                 }
             }
             if (hasPendingAttn) {
@@ -704,6 +716,7 @@ private:
     bool hasGamaK_;
     bool hasSourceState_;
     bool hasRecords_;
+    bool recordsOnly_;
     bool useAddFoldReduce_;
     float gama_;
     float beta_;

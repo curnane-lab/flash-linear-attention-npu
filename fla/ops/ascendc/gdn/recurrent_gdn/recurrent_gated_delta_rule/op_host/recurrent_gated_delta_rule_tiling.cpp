@@ -21,10 +21,28 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace optiling {
 
 REGISTER_OPS_TILING_TEMPLATE(RecurrentGatedDeltaRule, RecurrentGatedDeltaRuleTiling, 0);
+
+// R1 experimental records-only verify switch.  Read only here, at the tiling
+// layer; the aclnn and Stable-ABI signatures are unchanged.  Off by default;
+// when off the tiling buffer is byte-identical to the pre-switch build (the
+// recordsOnly tail field stays 0).
+static constexpr const char *RGDR_RECORDS_ONLY_ENV = "FLA_NPU_RGDR_RECORDS_ONLY";
+
+static bool ReadRecordsOnlySwitch()
+{
+    const char *value = std::getenv(RGDR_RECORDS_ONLY_ENV);
+    if (value == nullptr) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 ||
+           strcmp(value, "on") == 0;
+}
 
 const size_t QUERY_INDEX = 0;
 const size_t KEY_INDEX = 1;
@@ -373,6 +391,7 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetRecoverInputs()
     tilingData_.hasSourceState = 0;
     tilingData_.hasRecords = 0;
     tilingData_.recordPackMode = 0; // RGDR_RECORD_PACK_FUSED: [V] dc | [K] key | 1 alpha
+    tilingData_.recordsOnly = 0;    // R1 records-only verify: full mode by default
     tilingData_.recordStride0 = 0;
     tilingData_.recordStride1 = 0;
     tilingData_.recordStride2 = 0;
@@ -480,6 +499,9 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetRecoverInputs()
                             RGDR_MAX_MTP, static_cast<long>(recShape.GetDim(2))),
                     return ge::GRAPH_FAILED);
         tilingData_.hasRecords = 1;
+        // R1 records-only verify: out + records only, the kernel never writes
+        // the state pool.  Meaningful only when this call records.
+        tilingData_.recordsOnly = ReadRecordsOnlySwitch() ? 1U : 0U;
         auto recStride = context_->GetOutputStride(RECORDS_OUTPUT_INDEX);
         if (recStride != nullptr && recStride->GetDimNum() == RGDR_STATE_DIM_NUM) {
             tilingData_.recordStride0 = recStride->GetStride(0);
@@ -517,6 +539,7 @@ void RecurrentGatedDeltaRuleTiling::PrintTilingData()
     OP_LOGD(context_->GetNodeName(), "hasSourceState: [%u]", tilingData_.hasSourceState);
     OP_LOGD(context_->GetNodeName(), "hasRecords: [%u]", tilingData_.hasRecords);
     OP_LOGD(context_->GetNodeName(), "recordPackMode: [%u]", tilingData_.recordPackMode);
+    OP_LOGD(context_->GetNodeName(), "recordsOnly: [%u]", tilingData_.recordsOnly);
     OP_LOGD(context_->GetNodeName(), "recordStrides: [%u, %u, %u]", tilingData_.recordStride0, tilingData_.recordStride1,
             tilingData_.recordStride2);
     OP_LOGD(context_->GetNodeName(), "sourceStateStrides: [%u, %u, %u]", tilingData_.sourceStateStride0,

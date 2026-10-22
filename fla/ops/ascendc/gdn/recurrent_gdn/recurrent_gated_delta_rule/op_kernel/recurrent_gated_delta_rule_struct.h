@@ -79,6 +79,12 @@ struct alignas(8) RecurrentGatedDeltaRuleTilingData {
     // Any other value is an unsupported layout: the kernel then leaves records
     // untouched and the host layer is responsible for rejecting the call.
     uint32_t recordPackMode;
+    // R1 experimental records-only verify variant.  1 (only ever set together
+    // with hasRecords=1, via the host-side FLA_NPU_RGDR_RECORDS_ONLY switch) =>
+    // the verify kernel produces out + records and never writes the state pool:
+    // stateOutQueue_ is not allocated and no CopyOutState runs.  0 keeps the
+    // full mode bit-identical.
+    uint32_t recordsOnly;
 };
 #pragma pack(pop)
 

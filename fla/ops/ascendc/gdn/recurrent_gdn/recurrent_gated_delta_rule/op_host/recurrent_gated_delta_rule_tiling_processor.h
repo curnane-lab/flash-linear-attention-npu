@@ -381,11 +381,14 @@ private:
         (void)coeff;
         int64_t aDk = Ops::Base::CeilAlign(tiling.dk, static_cast<uint32_t>(16));
         BufferProfile selected;
-        const std::array<BufferProfile, 3> candidates = {{
-            {1, 1, 0, 0, false},
-            {1, 2, 0, 0, false},
-            {2, 2, 0, 0, false},
-        }};
+        // recordsOnly drops the whole state write path: stateOutBufferNum is
+        // fixed to 0, which removes the stateOutQueue_ term from the vStep
+        // coefficient below (the stateInQueue_ term -- reading the checkpoint
+        // -- stays) and frees that UB budget for vStep.
+        const bool recordsOnly = (tiling.recordsOnly == 1) && (tiling.hasRecords == 1);
+        const std::array<BufferProfile, 3> candidates =
+            recordsOnly ? std::array<BufferProfile, 3>{{{0, 1, 0, 0, false}, {0, 2, 0, 0, false}, {0, 2, 0, 0, false}}}
+                        : std::array<BufferProfile, 3>{{{1, 1, 0, 0, false}, {1, 2, 0, 0, false}, {2, 2, 0, 0, false}}};
         for (const auto &candidate : candidates) {
             BufferProfile profile;
             if (!EvaluateBufferProfile(ubSize, usedUbBytes, aDk, candidate.stateOutBufferNum, candidate.attnOutBufferNum,

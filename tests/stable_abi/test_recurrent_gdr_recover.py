@@ -16,7 +16,12 @@ exact, independent fp64 CPU reference:
    records step capacity (< MAX_MTP=8), ``source_state``/``state`` storage
    aliasing, ``gk``+``records`` pairing, ``record_indices`` without ``records``;
 5. mutation contract: one call bumps the ``state`` and ``records`` version
-   counters exactly once, and grad-requiring tensors are refused.
+   counters exactly once, and grad-requiring tensors are refused;
+6. the R1 records-only variant (``FLA_NPU_RGDR_RECORDS_ONLY=1``, internal
+   tiling-layer switch): out + records still match the fp64 oracle, the whole
+   state pool keeps its sentinel, and folding records[0, p) in fp64 from the
+   checkpoint reproduces the p-th destination row a full-mode run writes, for
+   every legal accepted prefix p in [1, window].
 
 Primitive-graph replay is NOT_APPLICABLE here: this harness has no
 graph-capture facility for this op family; replay bit-equality of the shipped
@@ -27,6 +32,14 @@ Run after installing the current build (see tests/stable_abi/README.md):
 """
 import argparse
 import ctypes
+import os
+
+# The aclnn executor cache keys on shape signatures and pins the host tiling
+# -- hence the FLA_NPU_RGDR_RECORDS_ONLY read -- to the first call of each
+# shape.  This suite flips that switch between same-shape calls (records-only
+# vs full mode), so the cache must be off for the flip to reach the tiling
+# layer.  setdefault keeps an explicit external setting authoritative.
+os.environ.setdefault("ACLNN_CACHE_LIMIT", "0")
 
 import torch
 import torch_npu  # noqa: F401
@@ -41,8 +54,19 @@ TOL_OUT = 5e-3    # bf16 output vs fp64 oracle
 TOL_STATE = 1e-3  # fp32 state vs fp64 oracle
 TOL_DC = 1e-3     # fp32 dc record
 TOL_ALPHA = 1e-5  # fp32 alpha = exp(g)
+TOL_COMMIT = 1e-5  # fp64 records fold vs full-mode destination row
+
+# R1 experimental records-only verify switch, read by the host tiling layer.
+RECORDS_ONLY_ENV = "FLA_NPU_RGDR_RECORDS_ONLY"
 
 FAILURES = []
+
+
+def _records_only(on):
+    if on:
+        os.environ[RECORDS_ONLY_ENV] = "1"
+    else:
+        os.environ.pop(RECORDS_ONLY_ENV, None)
 
 
 def report(name, ok, detail=""):
@@ -230,6 +254,128 @@ def check_numeric(name, case, d, out):
            f"key_exact={key_exact} rel_alpha={rel_alpha:.3e} "
            f"source_bit={source_bit} dest_untouched={dest_untouched} "
            f"records_untouched={records_untouched}")
+
+
+def check_records_only(name, case, d, out):
+    """records-only variant (FLA_NPU_RGDR_RECORDS_ONLY=1): out + records must
+    still match the fp64 oracle, and the ENTIRE state pool must keep its
+    sentinel -- the kernel may not write a single state row."""
+    ok = True
+    rel_out = rel(out.cpu(), case["ref_out"])
+    ok &= rel_out < TOL_OUT
+    state_sentinel = bool((d["state"].cpu() == SENTINEL).all().item())
+    ok &= state_sentinel
+    source_bit = bool((d["source"].cpu() == case["source"].float()).all().item())
+    ok &= source_bit
+
+    rec_full = d["records"].cpu()
+    ref = case["ref_records"]
+    rec = rec_full[:ref.shape[0], :, :ref.shape[2], :]
+    cell_mask = ~torch.isnan(ref[..., V + K])
+    rel_dc = rel(rec[..., :V][cell_mask], ref[..., :V][cell_mask])
+    ok &= rel_dc < TOL_DC
+    kidx = [hv // (case["HV"] // case["H"]) for hv in range(case["HV"])]
+    kb = case["k"].to(torch.bfloat16)
+    kref = torch.full_like(ref[..., V:V + K], float("nan"))
+    off = 0
+    for L in case["lengths"]:
+        for i in range(L):
+            t = off + i
+            kref[case["record_indices"][t], :, i, :] = kb[t][kidx].double()
+        off += L
+    mask = ~torch.isnan(kref)
+    key_exact = bool((rec[..., V:V + K][mask] == kref[mask].float()).all().item())
+    ok &= key_exact
+    rel_alpha = rel(rec[..., V + K][cell_mask], ref[..., V + K][cell_mask])
+    ok &= rel_alpha < TOL_ALPHA
+    untouched = torch.ones(rec_full.shape, dtype=torch.bool)
+    untouched[:ref.shape[0], :, :ref.shape[2], :] = torch.isnan(ref)
+    records_untouched = bool((rec_full[untouched] == SENTINEL).all().item())
+    ok &= records_untouched
+    report(name, ok,
+           f"rel_out={rel_out:.3e} rel_dc={rel_dc:.3e} key_exact={key_exact} "
+           f"rel_alpha={rel_alpha:.3e} state_sentinel={state_sentinel} "
+           f"source_bit={source_bit} records_untouched={records_untouched}")
+
+
+def fold_commit(case, rec, off, p):
+    """fp64 host fold: replay records[0, p) of one request onto its checkpoint
+    read row.  p == 0 is the rollback prefix (no write)."""
+    read_i = off if case["accepted"] is None else off + case["accepted"] - 1
+    M = case["source"][int(case["indices"][read_i])].double().clone()
+    for i in range(p):
+        row = rec[int(case["record_indices"][off + i]), :, i, :].double()
+        dc, key, alpha = row[:, :V], row[:, V:V + K], row[:, V + K]
+        M = alpha.view(-1, 1, 1) * M + torch.einsum("hv,hk->hvk", dc, key)
+    return M
+
+
+def scenario_records_only(device):
+    """R1 records-only verify variant.  The switch is process-local tiling
+    state (read per launch), so this scenario toggles it in-process and always
+    restores OFF for the rest of the suite."""
+    try:
+        _records_only(True)
+        # Numeric + zero state writes + source preservation on both entries,
+        # with an independent (reversed, shifted) record namespace so a kernel
+        # confusing record rows with state rows would fail.
+        T = 16
+        case = build_case([4, 4, 4, 4], 16, 32, seed=61,
+                          record_indices=[2 * T - 1 - t for t in range(T)])
+        for path, runner in (("stable", run_stable), ("aclnn", run_aclnn)):
+            d = to_dev(case, device)
+            check_records_only(f"records-only numeric permuted-records [{path}]",
+                               case, d, runner(case, d))
+            del d
+            torch.npu.empty_cache()
+
+        # Commit equivalence: for every legal accepted prefix p in [1, window],
+        # folding records[0, p) in fp64 from the checkpoint must reproduce the
+        # p-th destination row written by a full-mode (switch off) run of the
+        # same inputs.  p = 0 is the rollback prefix (nothing written) and is
+        # covered by the all-sentinel state check above.
+        for ci, (lengths, acc) in enumerate((([4, 4], None), ([4, 4], 2))):
+            case = build_case(lengths, 16, 32, seed=71 + ci, acc=acc)
+            _records_only(True)
+            d = to_dev(case, device)
+            run_stable(case, d)
+            rec = d["records"].cpu()
+            del d
+            _records_only(False)
+            d_full = to_dev(case, device)
+            run_stable(case, d_full)
+            dest = d_full["state"].cpu()
+            worst = 0.0
+            off = 0
+            for L in case["lengths"]:
+                for p in range(1, L + 1):
+                    folded = fold_commit(case, rec, off, p)
+                    target = dest[case["indices"][off + p - 1]].double()
+                    worst = max(worst, rel(folded, target))
+                off += L
+            tag = f"B{len(lengths)}/L{lengths[0]}" + (f"/acc{acc}" if acc else "")
+            report(f"records-only commit equivalence {tag}",
+                   worst <= TOL_COMMIT,
+                   f"max rel vs full-mode row = {worst:.3e}")
+            del d_full
+            torch.npu.empty_cache()
+
+        # Host guards stay in force with the switch on.
+        _records_only(True)
+        case = build_case([4], 16, 32, seed=81)
+        d = to_dev(case, device)
+        small_records = torch.zeros((case["T"], case["HV"], 1, V + K + 1),
+                                    dtype=torch.float32, device=device)
+        expect_reject("records-only reject stable: records dim 2 = 1 < MAX_MTP=8",
+                      lambda: npu_recurrent_gated_delta_rule_recover(
+                          d["q"], d["k"], d["v"], d["state"], beta=d["beta"],
+                          scale=d["scale"], actual_seq_lengths=d["csl"],
+                          ssm_state_indices=d["idx"], g=d["g"],
+                          source_state=d["source"], record_indices=d["ridx"],
+                          records=small_records),
+                      "must be >= MAX_MTP=8")
+    finally:
+        _records_only(False)
 
 
 def expect_reject(name, fn, needle=None):
@@ -439,10 +585,15 @@ def main():
     torch.manual_seed(20261022)
     device = f"npu:{args.device}"
 
+    # The original suite below is the full-mode (switch off) regression; an
+    # externally exported FLA_NPU_RGDR_RECORDS_ONLY must not leak into it.
+    _records_only(False)
+
     scenario_numeric(device)
     scenario_record_namespace(device)
     scenario_rejections(device)
     scenario_mutation_contract(device)
+    scenario_records_only(device)
     print("NOT_APPLICABLE primitive-graph replay: no graph-capture facility "
           "in this harness for this op family")
     if FAILURES:
