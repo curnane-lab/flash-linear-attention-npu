@@ -316,6 +316,20 @@ def _refuse_grad_state(name: str, state) -> None:
             "training.")
 
 
+def _storage_span(t) -> tuple[int, int]:
+    """Byte range [lo, hi) a tensor's view can touch on its storage.
+
+    Exact for positive strides (NPU tensors never carry negative ones) and
+    derived from shape/stride metadata only -- no device read, no sync.
+    """
+
+    span = 1
+    for size, stride in zip(t.shape, t.stride()):
+        span += (size - 1) * stride
+    lo = t.data_ptr()
+    return lo, lo + span * t.element_size()
+
+
 def _bump_state(state) -> None:
     """Bump a state argument's version counter after it was written in place."""
 
@@ -628,6 +642,24 @@ def npu_recurrent_gated_delta_rule_recover(
             "npu_recurrent_gated_delta_rule_recover: records dim 2 "
             "(per-request step capacity) must be >= MAX_MTP=8, got "
             f"{records.shape[2]}.")
+    if source_state is not None and state is not None:
+        # Alias contract v1: source_state is the read-only checkpoint, state is
+        # the write destination.  If their byte ranges intersect, a kernel
+        # write destroys the checkpoint the call promises to preserve, so the
+        # trivially detectable form (storage range overlap, host metadata
+        # only -- no sync) is rejected here.  Cross-request per-token
+        # conflicts (rule 3 of the contract) are index-VALUE properties; the
+        # host never reads device tensor values, so those stay the
+        # caller/adapter's responsibility -- the engine-side alias guard
+        # (the phase-n6 alias_guard is the reference) plugs in at the adapter
+        # level ahead of this entry.
+        s_lo, s_hi = _storage_span(source_state)
+        d_lo, d_hi = _storage_span(state)
+        if max(s_lo, d_lo) < min(s_hi, d_hi):
+            raise RuntimeError(
+                "npu_recurrent_gated_delta_rule_recover: source_state shares "
+                "storage with the destination state (byte ranges overlap); the "
+                "read-only checkpoint must not alias the write destination.")
 
     if state is not None and state.requires_grad:
         _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", state)
