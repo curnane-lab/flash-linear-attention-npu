@@ -561,7 +561,8 @@ int main()
 
 ## Recover 扩展接口（只读 checkpoint verify + 独立 records）
 
-> 本扩展在 ascend910b / ascend910_93 上验证；ascend950（arch35 kernel）暂不支持，host tiling 会显式拒绝。
+> 本扩展仅在 Ascend 910B3（`--soc=ascend910b`，CANN 9.1.0）上验证；ascend910_93 未执行；
+> ascend950（arch35 kernel）不支持 recover 操作数，host tiling 显式拒绝（非静默跳过）。
 
 在保持 `aclnnRecurrentGatedDeltaRule` 行为逐位不变的前提下，新增两段式接口
 `aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize` / `aclnnRecurrentGatedDeltaRuleRecover`，
