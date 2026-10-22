@@ -44,8 +44,9 @@ struct RGDRDTypeTraits<RGDR_TPL_FP32> {
 template <int D_T_STATE>
 __global__ __aicore__ void
 recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR beta, GM_ADDR state, GM_ADDR cuSeqlens,
-                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR out,
-                           GM_ADDR stateOut, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens,
+                           GM_ADDR sourceState, GM_ADDR recordIndices, GM_ADDR out,
+                           GM_ADDR stateOut, GM_ADDR records, GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
     REGISTER_TILING_DEFAULT(RecurrentGatedDeltaRuleTilingData);
     GET_TILING_DATA(tilingData, tilingGM);
@@ -54,7 +55,8 @@ recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR be
     using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
     RGDR<bfloat16_t, bfloat16_t, StateType> op(&tilingData);
     RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
-                              ssmStateIndices, numAcceptedTokens, out, stateOut};
+                              ssmStateIndices, numAcceptedTokens, out, stateOut,
+                              sourceState, recordIndices, records};
     op.Init(initParams, &pipe);
     op.Process();
 }

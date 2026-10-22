@@ -54,11 +54,34 @@ using GdrGetWorkspaceFn = int (*)(const aclTensor*, const aclTensor*,
                                   const aclTensor*, const aclTensor*, float,
                                   aclTensor*, uint64_t*, aclOpExecutor**);
 
+// aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize: sourceState travels
+// before stateRef and the records output goes last, matching the aclnn header.
+using GdrRecoverGetWorkspaceFn = int (*)(const aclTensor*, const aclTensor*,
+                                         const aclTensor*, const aclTensor*,
+                                         const aclTensor*, aclTensor*,
+                                         const aclTensor*, const aclTensor*,
+                                         const aclTensor*, const aclTensor*,
+                                         const aclTensor*, const aclTensor*,
+                                         float, aclTensor*, aclTensor*,
+                                         uint64_t*, aclOpExecutor**);
+
 constexpr const char* kSchemaRecurrentGdr =
     "npu_recurrent_gated_delta_rule(Tensor query, Tensor key, Tensor value, "
     "Tensor(a!) state, Tensor beta, Tensor actual_seq_lengths, "
     "Tensor ssm_state_indices, Tensor? num_accepted_tokens, Tensor? g, "
     "Tensor? gk, float scale, int stream) -> Tensor";
+
+// Recover variant (N5/D1): adds the optional read-only checkpoint
+// (source_state), the per-token records row index (record_indices) and the
+// records output.  `records` is written in place at record_indices rows, so it
+// is declared mutable like `state`; passing None for all three reproduces the
+// legacy op bit for bit.
+constexpr const char* kSchemaRecurrentGdrRecover =
+    "npu_recurrent_gated_delta_rule_recover(Tensor query, Tensor key, "
+    "Tensor value, Tensor(a!) state, Tensor beta, Tensor actual_seq_lengths, "
+    "Tensor ssm_state_indices, Tensor? num_accepted_tokens, Tensor? g, "
+    "Tensor? gk, Tensor? source_state, Tensor? record_indices, "
+    "Tensor(a!)? records, float scale, int stream) -> Tensor";
 
 // Returns the attn output; `state` is an in/out ref, exactly like ctypes.
 Tensor run_recurrent_gated_delta_rule(AtenTensorHandle query,
@@ -200,6 +223,140 @@ void boxed_recurrent_gated_delta_rule(StableIValue* stack,
       g.has_value() ? std::optional<AtenTensorHandle>(g->get()) : std::nullopt,
       gk.has_value() ? std::optional<AtenTensorHandle>(gk->get())
                      : std::nullopt,
+      scale, stream);
+  stack[0] = from(out);
+}
+
+// Returns the attn output; `state` and `records` are in/out refs.  The two new
+// optional operands default to the legacy behaviour when absent.
+Tensor run_recurrent_gated_delta_rule_recover(
+    AtenTensorHandle query, AtenTensorHandle key, AtenTensorHandle value,
+    AtenTensorHandle state, AtenTensorHandle beta,
+    AtenTensorHandle actual_seq_lengths, AtenTensorHandle ssm_state_indices,
+    std::optional<AtenTensorHandle> num_accepted_tokens,
+    std::optional<AtenTensorHandle> g, std::optional<AtenTensorHandle> gk,
+    std::optional<AtenTensorHandle> source_state,
+    std::optional<AtenTensorHandle> record_indices,
+    std::optional<AtenTensorHandle> records, double scale, int64_t stream) {
+  auto& rt = fla_npu_stable::Runtime::instance();
+  auto get_ws = reinterpret_cast<GdrRecoverGetWorkspaceFn>(
+      rt.symbol("aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize"));
+  auto launch =
+      reinterpret_cast<LaunchFn>(rt.symbol("aclnnRecurrentGatedDeltaRuleRecover"));
+  check_async_failure();
+
+  const TensorMeta value_meta = meta_of_handle(value);
+  Tensor out = allocate_like(value_meta);
+
+  AclTensorView v_query(meta_of_handle(query), kAclFormatNd);
+  AclTensorView v_key(meta_of_handle(key), kAclFormatNd);
+  AclTensorView v_value(value_meta, kAclFormatNd);
+  AclTensorView v_beta(meta_of_handle(beta), kAclFormatNd);
+  AclTensorView v_state(meta_of_handle(state), kAclFormatNd);
+  AclTensorView v_seq(meta_of_handle(actual_seq_lengths), kAclFormatNd);
+  AclTensorView v_idx(meta_of_handle(ssm_state_indices), kAclFormatNd);
+  AclTensorView v_g(meta_optional_handle(g), kAclFormatNd);
+  AclTensorView v_gk(meta_optional_handle(gk), kAclFormatNd);
+  AclTensorView v_accepted(meta_optional_handle(num_accepted_tokens), kAclFormatNd);
+  AclTensorView v_source(meta_optional_handle(source_state), kAclFormatNd);
+  AclTensorView v_record_idx(meta_optional_handle(record_indices), kAclFormatNd);
+  AclTensorView v_records(meta_optional_handle(records), kAclFormatNd);
+  AclTensorView v_out(meta_of(out), kAclFormatNd);
+
+  uint64_t workspace_size = 0;
+  aclOpExecutor* executor = nullptr;
+  const int get_ret = get_ws(
+      v_query.get(), v_key.get(), v_value.get(), v_beta.get(), v_source.get(),
+      v_state.get(), v_seq.get(), v_idx.get(), v_record_idx.get(), v_g.get(),
+      v_gk.get(), v_accepted.get(), static_cast<float>(scale), v_out.get(),
+      v_records.get(), &workspace_size, &executor);
+  if (get_ret != 0) {
+    throw std::runtime_error(
+        "fla_npu(stable): aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize "
+        "failed: " +
+        std::to_string(get_ret));
+  }
+
+  Tensor workspace;
+  void* workspace_ptr = nullptr;
+  if (workspace_size != 0) {
+    workspace = allocate_bytes(static_cast<int64_t>(workspace_size), value_meta);
+    TORCH_ERROR_CODE_CHECK(
+        aoti_torch_get_data_ptr(workspace.get(), &workspace_ptr));
+  }
+
+  note_launch_stream(stream);
+  auto held = std::make_tuple(
+      std::move(v_query), std::move(v_key), std::move(v_value),
+      std::move(v_beta), std::move(v_state), std::move(v_seq),
+      std::move(v_idx), std::move(v_g), std::move(v_gk),
+      std::move(v_accepted), std::move(v_source), std::move(v_record_idx),
+      std::move(v_records), std::move(v_out));
+  if (enqueue_launch(rt, "aclnnRecurrentGatedDeltaRuleRecover", launch, stream,
+                     workspace_ptr, workspace_size, executor, held)) {
+    return out;
+  }
+  const int launch_ret =
+      launch(workspace_ptr, workspace_size, executor,
+             reinterpret_cast<void*>(stream));
+  if (launch_ret != 0) {
+    throw std::runtime_error(
+        "fla_npu(stable): aclnnRecurrentGatedDeltaRuleRecover failed: " +
+        std::to_string(launch_ret));
+  }
+  return out;
+}
+
+// Boxed entry point: same ownership rules as boxed_recurrent_gated_delta_rule
+// above (one owning Tensor per required slot, optionals via
+// std::optional<Tensor>).
+void boxed_recurrent_gated_delta_rule_recover(StableIValue* stack,
+                                              uint64_t num_inputs,
+                                              uint64_t num_outputs) {
+  if (num_inputs != 15 || num_outputs != 1) {
+    throw std::runtime_error(
+        "fla_npu(stable): npu_recurrent_gated_delta_rule_recover takes 15 "
+        "inputs and 1 output, the stack declares " + std::to_string(num_inputs) +
+        " and " + std::to_string(num_outputs));
+  }
+  const Tensor t_query = to<Tensor>(stack[0]);
+  const Tensor t_key = to<Tensor>(stack[1]);
+  const Tensor t_value = to<Tensor>(stack[2]);
+  const Tensor t_state = to<Tensor>(stack[3]);
+  const Tensor t_beta = to<Tensor>(stack[4]);
+  const Tensor t_actual_seq_lengths = to<Tensor>(stack[5]);
+  const Tensor t_ssm_state_indices = to<Tensor>(stack[6]);
+  const AtenTensorHandle query = t_query.get();
+  const AtenTensorHandle key = t_key.get();
+  const AtenTensorHandle value = t_value.get();
+  const AtenTensorHandle state = t_state.get();
+  const AtenTensorHandle beta = t_beta.get();
+  const AtenTensorHandle actual_seq_lengths = t_actual_seq_lengths.get();
+  const AtenTensorHandle ssm_state_indices = t_ssm_state_indices.get();
+  const auto num_accepted_tokens = to<std::optional<Tensor>>(stack[7]);
+  const auto g = to<std::optional<Tensor>>(stack[8]);
+  const auto gk = to<std::optional<Tensor>>(stack[9]);
+  const auto source_state = to<std::optional<Tensor>>(stack[10]);
+  const auto record_indices = to<std::optional<Tensor>>(stack[11]);
+  const auto records = to<std::optional<Tensor>>(stack[12]);
+  const double scale = to<double>(stack[13]);
+  const int64_t stream = to<int64_t>(stack[14]);
+  Tensor out = run_recurrent_gated_delta_rule_recover(
+      query, key, value, state, beta, actual_seq_lengths, ssm_state_indices,
+      num_accepted_tokens.has_value()
+          ? std::optional<AtenTensorHandle>(num_accepted_tokens->get())
+          : std::nullopt,
+      g.has_value() ? std::optional<AtenTensorHandle>(g->get()) : std::nullopt,
+      gk.has_value() ? std::optional<AtenTensorHandle>(gk->get())
+                     : std::nullopt,
+      source_state.has_value()
+          ? std::optional<AtenTensorHandle>(source_state->get())
+          : std::nullopt,
+      record_indices.has_value()
+          ? std::optional<AtenTensorHandle>(record_indices->get())
+          : std::nullopt,
+      records.has_value() ? std::optional<AtenTensorHandle>(records->get())
+                          : std::nullopt,
       scale, stream);
   stack[0] = from(out);
 }

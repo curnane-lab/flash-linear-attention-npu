@@ -565,6 +565,79 @@ def npu_recurrent_gated_delta_rule(
     return result
 
 
+def npu_recurrent_gated_delta_rule_recover(
+    query,
+    key,
+    value,
+    state,
+    *,
+    beta,
+    scale=1.0,
+    actual_seq_lengths,
+    ssm_state_indices,
+    num_accepted_tokens=None,
+    g=None,
+    gk=None,
+    source_state=None,
+    record_indices=None,
+    records=None,
+):
+    """Recurrent GDN forward with read-only checkpoint verify + records.
+
+    ``source_state`` is the read-only checkpoint the initial state is read from
+    (``state`` stays the write destination, so the checkpoint row is preserved);
+    ``record_indices``/``records`` capture, per token, the packed row
+    ``[V] dc | [K] key | 1 alpha`` at ``records[record_indices[t], head, step]``.
+    All three are optional; omitting them reproduces
+    ``npu_recurrent_gated_delta_rule`` bit for bit.  ``state`` and ``records``
+    are mutated in place.
+    """
+
+    if g is None and gk is None:
+        raise RuntimeError(
+            "npu_recurrent_gated_delta_rule_recover: either g or gk must be "
+            "provided.")
+    if (record_indices is None) != (records is None):
+        raise RuntimeError(
+            "npu_recurrent_gated_delta_rule_recover: record_indices and records "
+            "must be provided together.")
+    if record_indices is not None and gk is not None:
+        raise RuntimeError(
+            "npu_recurrent_gated_delta_rule_recover: records are not supported "
+            "together with gk (per-K gate): the alpha record field is scalar.")
+
+    if state is not None and state.requires_grad:
+        _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", state)
+    stream = _current_stream_ptr()
+    op = _OP_CACHE.get("npu_recurrent_gated_delta_rule_recover")
+    if op is None:
+        op = _op("npu_recurrent_gated_delta_rule_recover")
+    result = op(
+        query,
+        key,
+        value,
+        state,
+        beta,
+        actual_seq_lengths,
+        ssm_state_indices,
+        num_accepted_tokens,
+        g,
+        gk,
+        source_state,
+        record_indices,
+        records,
+        float(scale),
+        stream,
+    )
+    bump = _INC_VERSION
+    if bump is None:
+        bump = _increment_version()
+    mutated = [t for t in (state, records) if t is not None]
+    if mutated:
+        bump(tuple(mutated))
+    return result
+
+
 def npu_recurrent_kda(
     q,
     k,

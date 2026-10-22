@@ -44,16 +44,65 @@ const aclTensor *RecurrentGatedDeltaRule(const aclTensor *query, const aclTensor
              return nullptr);
 
     // infershape
+    // The kernel's argument block is fixed by the op proto (12 inputs + 3
+    // outputs): absent optional inputs travel as nullptr, and an absent records
+    // output is aliased to the internal `out` tensor (a null entry in OP_OUTPUT
+    // is not tolerated by the InferShape machinery; hasRecords=0 makes the
+    // kernel ignore the pointer).  The legacy operand list therefore stays
+    // bit-identical in behaviour to the pre-extension op.
     auto ret = INFER_SHAPE(
         RecurrentGatedDeltaRule,
-        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens),
-        OP_OUTPUT(out, stateRef), OP_ATTR(scaleValue));
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 (const aclTensor *)nullptr, (const aclTensor *)nullptr),
+        OP_OUTPUT(out, stateRef, out), OP_ATTR(scaleValue));
     OP_CHECK_INFERSHAPE(ret != ACLNN_SUCCESS, return nullptr, "RecurrentGatedDeltaRule InferShape failed.");
 
     ret = ADD_TO_LAUNCHER_LIST_AICORE(
         RecurrentGatedDeltaRule,
-        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens),
-        OP_OUTPUT(out, stateRef), OP_ATTR(scaleValue));
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 (const aclTensor *)nullptr, (const aclTensor *)nullptr),
+        OP_OUTPUT(out, stateRef, out), OP_ATTR(scaleValue));
+    OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(ret != ACLNN_SUCCESS, return nullptr,
+                                         "RecurrentGatedDeltaRule ADD_TO_LAUNCHER_LIST_AICORE failed.");
+
+    return out;
+}
+
+const aclTensor *RecurrentGatedDeltaRuleRecover(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta,
+    const aclTensor *sourceState, aclTensor *stateRef, const aclTensor *actualSeqLengths,
+    const aclTensor *ssmStateIndices, const aclTensor *recordIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *records, aclOpExecutor *executor)
+{
+    L0_DFX(RecurrentGatedDeltaRuleRecover, query, key, value, beta, sourceState, stateRef, actualSeqLengths,
+           ssmStateIndices, recordIndices, g, gk, numAcceptedTokens, scaleValue);
+
+    DataType outType = DataType::DT_BF16;
+    Format format = Format::FORMAT_ND;
+
+    auto out = executor->AllocTensor(outType, format, format);
+
+    OP_CHECK(out != nullptr, OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "out AllocTensor failed."),
+             return nullptr);
+
+    // Same fixed 12-input/3-output operand contract as the legacy entry above:
+    // absent optional inputs are nullptr; an absent records output is aliased
+    // to the internal `out` tensor and ignored by the kernel (hasRecords=0).
+    const aclTensor *recordsArg = (records != nullptr) ? records : out;
+
+    // infershape
+    auto ret = INFER_SHAPE(
+        RecurrentGatedDeltaRule,
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 sourceState, recordIndices),
+        OP_OUTPUT(out, stateRef, recordsArg), OP_ATTR(scaleValue));
+    OP_CHECK_INFERSHAPE(ret != ACLNN_SUCCESS, return nullptr, "RecurrentGatedDeltaRule InferShape failed.");
+
+    ret = ADD_TO_LAUNCHER_LIST_AICORE(
+        RecurrentGatedDeltaRule,
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 sourceState, recordIndices),
+        OP_OUTPUT(out, stateRef, recordsArg), OP_ATTR(scaleValue));
     OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(ret != ACLNN_SUCCESS, return nullptr,
                                          "RecurrentGatedDeltaRule ADD_TO_LAUNCHER_LIST_AICORE failed.");
 

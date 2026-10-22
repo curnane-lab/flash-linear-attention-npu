@@ -35,6 +35,7 @@ const size_t DIM_0 = 0;
 const size_t DIM_1 = 1;
 const size_t DIM_2 = 2;
 const size_t DIM_3 = 3;
+const size_t RECORDS_OUTPUT_INDEX = 2;
 
 static ge::graphStatus InferShapeRecurrentGatedDeltaRule(InferShapeContext *context)
 {
@@ -71,6 +72,10 @@ static ge::graphStatus InferShapeRecurrentGatedDeltaRule(InferShapeContext *cont
     shapeFinalState->SetDim(DIM_2, stateDim2);
     shapeFinalState->SetDim(DIM_3, stateDim3);
 
+    // records (optional output, index 2) is caller-sized: [Nrecord, HV, T, V+K+1]
+    // with Nrecord chosen by the caller, so its shape cannot be derived from the
+    // inputs here.  The aclnn entry passes the caller's tensor straight through;
+    // keep the shape it already carries instead of overwriting it.
     return ge::GRAPH_SUCCESS;
 }
 
@@ -78,6 +83,9 @@ static ge::graphStatus InferDataTypeRecurrentGatedDeltaRule(gert::InferDataTypeC
 {
     context->SetOutputDataType(0, ge::DT_BF16);
     context->SetOutputDataType(1, context->GetInputDataType(STATE_INDEX));
+    if (context->GetComputeNodeOutputNum() > RECORDS_OUTPUT_INDEX) {
+        context->SetOutputDataType(RECORDS_OUTPUT_INDEX, ge::DT_FLOAT);
+    }
     return ge::GRAPH_SUCCESS;
 }
 

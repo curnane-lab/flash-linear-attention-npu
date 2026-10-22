@@ -63,6 +63,22 @@ struct alignas(8) RecurrentGatedDeltaRuleTilingData {
     uint32_t stateStride0;
  	uint32_t stateStride1;
  	uint32_t stateStride2;
+    // N2 extension: appended tail keeps every legacy offset below unchanged, so a
+    // tiling buffer produced by the old host tiling function still parses, and a
+    // legacy call site (new inputs absent) still selects the legacy path.
+    uint32_t hasSourceState;       // 1 => read the initial state from `source_state`
+    uint32_t hasRecords;           // 1 => write per-token records into `records`
+    uint32_t recordStride0;        // records row stride       [elements]
+    uint32_t recordStride1;        // records head stride      [elements]
+    uint32_t recordStride2;        // records step stride      [elements]
+    uint32_t sourceStateStride0;   // source_state row stride  [elements]
+    uint32_t sourceStateStride1;   // source_state head stride [elements]
+    uint32_t sourceStateStride2;   // source_state v stride    [elements]
+    // Inner pack selector for one records row.  0 = the frozen P1 packing
+    //   [0,V) = dc | [V,V+K) = normalized key | [V+K] = alpha
+    // Any other value is an unsupported layout: the kernel then leaves records
+    // untouched and the host layer is responsible for rejecting the call.
+    uint32_t recordPackMode;
 };
 #pragma pack(pop)
 

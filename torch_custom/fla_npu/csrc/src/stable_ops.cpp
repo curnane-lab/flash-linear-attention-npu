@@ -96,6 +96,7 @@ int64_t fla_npu_stable_last_launch_stream() {
 // them by position).
 STABLE_TORCH_LIBRARY(fla_npu_stable, m) {
   m.def(kSchemaRecurrentGdr);
+  m.def(kSchemaRecurrentGdrRecover);
   m.def(kSchemaRecurrentKda);
   m.def(kSchema_npu_fast_gelu_custom);
   m.def(kSchema_npu_fast_gelu_custom_backward);
@@ -139,6 +140,8 @@ STABLE_TORCH_LIBRARY(fla_npu_stable, m) {
 
 STABLE_TORCH_LIBRARY_IMPL(fla_npu_stable, CompositeExplicitAutograd, m) {
   m.impl("npu_recurrent_gated_delta_rule", &boxed_recurrent_gated_delta_rule);
+  m.impl("npu_recurrent_gated_delta_rule_recover",
+         &boxed_recurrent_gated_delta_rule_recover);
   m.impl("npu_recurrent_kda", &boxed_recurrent_kda);
   m.impl("npu_fast_gelu_custom",
          &fla_npu_stable::stable::boxed_adapter<run_npu_fast_gelu_custom>);

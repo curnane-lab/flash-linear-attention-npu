@@ -31,6 +31,10 @@ constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint32_t REPEAT_LENTH = 64; // 256Byte for float
 constexpr uint32_t MAX_REPEAT_TIME = 255;
 constexpr uint32_t ADD_FOLD_REDUCE_MIN_K = 128;
+// Records row layout selected by tiling.recordPackMode.  Only the frozen P1
+// packing is implemented; the inner offsets live in RecordDcOffset/RecordKeyOffset/
+// RecordAlphaOffset so a second packing is a single-place edit.
+constexpr uint32_t RGDR_RECORD_PACK_FUSED = 0;
 
 #ifndef RGDR_ENABLE_ADD_FOLD_REDUCE
 #define RGDR_ENABLE_ADD_FOLD_REDUCE  1
@@ -48,6 +52,11 @@ struct RGDRInitParams {
     GM_ADDR numAcceptedTokens;
     GM_ADDR attnOut;
     GM_ADDR finalState;
+    // N2 extension: optional read-only checkpoint, per-token record row index and
+    // the records destination.  Null pointers keep the legacy behaviour.
+    GM_ADDR sourceState;
+    GM_ADDR recordIndices;
+    GM_ADDR records;
 };
 
 template <typename inType, typename outType, typename stateType>
@@ -75,6 +84,14 @@ public:
         restUbSize_ = tilingData->ubRestBytes;
         alignK_ = Ceil(tilingData->dk, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
+        hasSourceState_ = (tilingData->hasSourceState == 1);
+        hasRecords_ = (tilingData->hasRecords == 1) && (tilingData->recordPackMode == RGDR_RECORD_PACK_FUSED);
+        recordStride0_ = tilingData->recordStride0;
+        recordStride1_ = tilingData->recordStride1;
+        recordStride2_ = tilingData->recordStride2;
+        sourceStateStride0_ = tilingData->sourceStateStride0;
+        sourceStateStride1_ = tilingData->sourceStateStride1;
+        sourceStateStride2_ = tilingData->sourceStateStride2;
         load = 0;
         usedblk = 0;
     }
@@ -105,6 +122,9 @@ public:
         numAcceptedTokensGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.numAcceptedTokens);
         finalStateGm_.SetGlobalBuffer((__gm__ stateType *)initParams.finalState);
         attnOutGm_.SetGlobalBuffer((__gm__ outType *)initParams.attnOut);
+        sourceStateGm_.SetGlobalBuffer((__gm__ stateType *)initParams.sourceState);
+        recordIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.recordIndices);
+        recordsGm_.SetGlobalBuffer((__gm__ float *)initParams.records);
     }
 
     __aicore__ inline void InitLocalBuffers()
@@ -128,6 +148,11 @@ public:
         pipe_->InitBuffer(betaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(inType));
         pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, alignK_ * vStep_ * sizeof(stateType));
         pipe_->InitBuffer(attnOutQueue_, attnOutBufferNum_, vStep_ * sizeof(outType));
+        if (hasRecords_) {
+            // One rows-in-flight staging buffer: [dc(curSingleV) | k(realK) | alpha(1)].
+            pipe_->InitBuffer(recordsOutQueue_, BUFFER_NUM,
+                              (vStep_ + alignK_ + FP32_NUM_PER_BLOCK) * sizeof(float));
+        }
         pipe_->InitBuffer(tmpBuff, restUbSize_);
         uint32_t buffOffset = 0;
         deltaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(vStep_), buffOffset);
@@ -248,13 +273,28 @@ private:
         vInQueue_.FreeTensor(vLocal);
     }
 
+    // Element offset of (row, head, v) in whichever checkpoint tensor is the read
+    // source.  `stateOffset` is already the row index resolved from
+    // ssm_state_indices; only the strides differ between `state` and `source_state`.
+    __aicore__ inline uint64_t CheckpointReadOffset(uint64_t rowIndex, uint64_t head_i, uint64_t vOffset) const
+    {
+        if (hasSourceState_) {
+            return sourceStateStride0_ * rowIndex + sourceStateStride1_ * head_i + sourceStateStride2_ * vOffset;
+        }
+        return stateStride0_ * rowIndex + stateStride1_ * head_i + stateStride2_ * vOffset;
+    }
+
     __aicore__ inline void PrefetchState(uint64_t stateOffest, uint32_t curSingleV)
     {
         LocalTensor<stateType> stateLocal = stateInQueue_.AllocTensor<stateType>();
         DataCopyExtParams stateInParams{static_cast<uint16_t>(curSingleV),
                                         static_cast<uint16_t>(realK_ * sizeof(stateType)), 0, 0, 0};
         DataCopyPadExtParams<stateType> padParams{true, 0, static_cast<uint8_t>(alignK_ - realK_), 0};
-        DataCopyPad(stateLocal, initStateGm_[stateOffest], stateInParams, padParams);
+        if (hasSourceState_) {
+            DataCopyPad(stateLocal, sourceStateGm_[stateOffest], stateInParams, padParams);
+        } else {
+            DataCopyPad(stateLocal, initStateGm_[stateOffest], stateInParams, padParams);
+        }
         stateInQueue_.EnQue<stateType>(stateLocal);
     }
 
@@ -456,6 +496,43 @@ private:
         stateOutQueue_.FreeTensor(stateOutLocal);
     }
 
+    // Frozen P1 inner packing of one records row: [0,V) dc | [V,V+K) key | [V+K] alpha.
+    // These three offsets are into the *records row* (GM); they are the single place a
+    // second packing would have to change, and they are deliberately not reused as
+    // offsets into the UB staging buffer, whose size follows vStep_ rather than realV_.
+    __aicore__ inline uint32_t RecordDcOffset() const { return 0; }
+    __aicore__ inline uint32_t RecordKeyOffset() const { return realV_; }
+    __aicore__ inline uint32_t RecordAlphaOffset() const { return realV_ + realK_; }
+
+    // Stage the per-token record for one v slice and push it out.  `rowOffset` is the
+    // element offset of the row [dc|k|alpha] start; `vInnerOffset` is the v index of
+    // the slice inside the row; the key and alpha are per (head, step), so they are
+    // staged on the first slice only.
+    __aicore__ inline void CopyOutRecords(uint64_t rowOffset, uint32_t vInnerOffset, uint32_t curSingleV,
+                                          uint32_t curQKOffset)
+    {
+        LocalTensor<float> recLocal = recordsOutQueue_.AllocTensor<float>();
+        Muls(recLocal[0], deltaInUb, 1.0f, curSingleV);      // dc of this slice at stage offset 0
+        const uint32_t stageOffset = curSingleV;             // UB staging, independent of the row layout
+        if (vInnerOffset == 0) {
+            Muls(recLocal[stageOffset], kInUb[curQKOffset], 1.0f, realK_);
+            Duplicate(recLocal[stageOffset + realK_], gama_, 1);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        recordsOutQueue_.EnQue<float>(recLocal);
+        LocalTensor<float> recOutLocal = recordsOutQueue_.DeQue<float>();
+        DataCopyParams dcParams{1, static_cast<uint16_t>(curSingleV * sizeof(float)), 0, 0};
+        DataCopyPad(recordsGm_[rowOffset + RecordDcOffset() + vInnerOffset], recOutLocal[0], dcParams);
+        if (vInnerOffset == 0) {
+            DataCopyParams keyParams{1, static_cast<uint16_t>(realK_ * sizeof(float)), 0, 0};
+            DataCopyPad(recordsGm_[rowOffset + RecordKeyOffset()], recOutLocal[stageOffset], keyParams);
+            DataCopyParams alphaParams{1, static_cast<uint16_t>(sizeof(float)), 0, 0};
+            DataCopyPad(recordsGm_[rowOffset + RecordAlphaOffset()],
+                        recOutLocal[stageOffset + realK_], alphaParams);
+        }
+        recordsOutQueue_.FreeTensor(recOutLocal);
+    }
+
     __aicore__ inline void CopyInGamaBeta(int32_t seq0, int32_t seq1)
     {
         int32_t seqLen = seq1 - seq0;
@@ -492,7 +569,7 @@ private:
         }
         uint64_t nextVOffset = 0;
         uint32_t nextSingleV = realV_ > vStep_ ? vStep_ : realV_;
-        uint64_t nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i;
+        uint64_t nextStateOffset = CheckpointReadOffset(stateOffset, head_i, 0);
         PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
@@ -500,7 +577,7 @@ private:
             nextVOffset = v_i + vStep_;
             if (nextVOffset < realV_) {
                 nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
-                nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i + stateStride2_ * nextVOffset;
+                nextStateOffset = CheckpointReadOffset(stateOffset, head_i, nextVOffset);
                 PrefetchState(nextStateOffset, nextSingleV);
             }
             uint64_t pendingAttnOffset = 0;
@@ -515,9 +592,18 @@ private:
                 uint64_t curStateOutOffset =
                     static_cast<uint64_t>(stateStride0_) * ssmStateIndicesGm_.GetValue(seq_i) +
                     stateStride1_ * head_i + stateStride2_ * v_i;
+                uint64_t curRecordOffset = 0;
+                if (hasRecords_) {
+                    curRecordOffset =
+                        recordStride0_ * static_cast<uint64_t>(recordIndicesGm_.GetValue(seq_i)) +
+                        recordStride1_ * head_i + recordStride2_ * (seq_i - seq0);
+                }
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
+                if (hasRecords_) {
+                    CopyOutRecords(curRecordOffset, v_i, curSingleV, curQKOffset);
+                }
                 if (attnOutBufferNum_ == BUFFER_NUM) {
                     CopyOutAttn(attnOffset, curSingleV);
                 } else {
@@ -573,6 +659,9 @@ private:
     GlobalTensor<int32_t> numAcceptedTokensGm_;
     GlobalTensor<stateType> finalStateGm_;
     GlobalTensor<outType> attnOutGm_;
+    GlobalTensor<stateType> sourceStateGm_;
+    GlobalTensor<int32_t> recordIndicesGm_;
+    GlobalTensor<float> recordsGm_;
     TPipe *pipe_;
     TQue<QuePosition::VECIN, 1> qInQueue_;
     TQue<QuePosition::VECIN, 1> kInQueue_;
@@ -583,6 +672,7 @@ private:
     TQue<QuePosition::VECIN, 1> stateInQueue_;
     TQue<QuePosition::VECOUT, MAX_OUT_BUFFER_NUM> attnOutQueue_;
     TQue<QuePosition::VECOUT, MAX_OUT_BUFFER_NUM> stateOutQueue_;
+    TQue<QuePosition::VECOUT, BUFFER_NUM> recordsOutQueue_;
     TBuf<TPosition::VECCALC> tmpBuff;
     LocalTensor<float> qInUb;
     LocalTensor<float> kInUb;
@@ -612,6 +702,8 @@ private:
     bool hasAcceptedTokens_;
     bool hasGama_;
     bool hasGamaK_;
+    bool hasSourceState_;
+    bool hasRecords_;
     bool useAddFoldReduce_;
     float gama_;
     float beta_;
@@ -620,6 +712,12 @@ private:
     uint32_t stateStride0_;
     uint32_t stateStride1_;
     uint32_t stateStride2_;
+    uint32_t recordStride0_;
+    uint32_t recordStride1_;
+    uint32_t recordStride2_;
+    uint32_t sourceStateStride0_;
+    uint32_t sourceStateStride1_;
+    uint32_t sourceStateStride2_;
 };
 } // namespace RecurrentGatedDeltaRule
 #endif

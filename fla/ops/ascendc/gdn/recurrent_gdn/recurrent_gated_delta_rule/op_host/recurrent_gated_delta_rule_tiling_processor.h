@@ -44,6 +44,8 @@ static constexpr size_t RGDR_DIM_3 = 3;
 static constexpr size_t RGDR_MAX_MTP = 8;
 static constexpr size_t RGDR_SYS_WORKSPACE_SIZE = 16U * 1024U * 1024U;
 static constexpr uint32_t RGDR_REQUIRED_DIM = 128;
+static constexpr int64_t RGDR_FP32_NUM_PER_BLOCK = 8;
+static constexpr int64_t RGDR_FP32_BYTES = 4;
 
 struct RecurrentGatedDeltaRuleTilingContext {
     const char *nodeName = "RecurrentGatedDeltaRule";
@@ -58,6 +60,8 @@ struct RecurrentGatedDeltaRuleTilingContext {
     uint32_t hasGama = 0;
     uint32_t hasGamaK = 0;
     uint32_t hasAcceptedTokens = 0;
+    uint32_t hasSourceState = 0;
+    uint32_t hasRecords = 0;
     ge::DataType stateDtype = ge::DT_BF16;
     uint64_t aivNum = 0;
     uint64_t ubSize = 0;
@@ -120,6 +124,8 @@ public:
         tiling.hasGama = ctx_.hasGama;
         tiling.hasGamaK = ctx_.hasGamaK;
         tiling.hasAcceptedTokens = ctx_.hasAcceptedTokens;
+        tiling.hasSourceState = ctx_.hasSourceState;
+        tiling.hasRecords = ctx_.hasRecords;
 
         OP_CHECK_IF(ProcessUb(tiling) != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
 
@@ -300,6 +306,12 @@ private:
             usedUbBytes += RGDR_MAX_MTP * 4 * aNv;
         }
         usedUbBytes += RGDR_MAX_MTP * 2 * aNv;
+        // recordsOutQueue_ (kernel, BUFFER_NUM=1): (vStep + alignK + 8) floats; the
+        // vStep-independent part is budgeted here, the per-vStep part goes into
+        // CalcVStepCoeff / the FinalizeVStepFromUb queue coefficient.
+        if (tiling.hasRecords) {
+            usedUbBytes += (aDk + RGDR_FP32_NUM_PER_BLOCK) * RGDR_FP32_BYTES;
+        }
         return usedUbBytes;
     }
 
@@ -311,12 +323,16 @@ private:
         return usedUbBytes;
     }
 
-    int64_t CalcVStepCoeff(int64_t aDk, uint32_t stateOutBufferNum, uint32_t attnOutBufferNum) const
+    int64_t CalcVStepCoeff(int64_t aDk, uint32_t stateOutBufferNum, uint32_t attnOutBufferNum,
+                           uint32_t hasRecords) const
     {
         int64_t stateDtypeSize = (ctx_.stateDtype == ge::DT_FLOAT) ? 4 : 2;
         int64_t coeff = (stateDtypeSize + static_cast<int64_t>(stateDtypeSize * stateOutBufferNum)) * aDk +
                         static_cast<int64_t>(4 * attnOutBufferNum);
         coeff += (4 + 4) * aDk + 4 + 4;
+        if (hasRecords) {
+            coeff += RGDR_FP32_BYTES; // recordsOutQueue_ per-vStep float
+        }
         return coeff;
     }
 
@@ -324,7 +340,7 @@ private:
                                uint32_t attnOutBufferNum, const RecurrentGatedDeltaRuleTilingData &tiling,
                                BufferProfile &profile) const
     {
-        int64_t coeff = CalcVStepCoeff(aDk, stateOutBufferNum, attnOutBufferNum);
+        int64_t coeff = CalcVStepCoeff(aDk, stateOutBufferNum, attnOutBufferNum, tiling.hasRecords);
         int64_t vStep = (ubSize - usedUbBytes) / coeff / 8 * 8;
         if (vStep < 8) {
             return false;
@@ -395,6 +411,9 @@ private:
         int64_t stateDtypeSize = (ctx_.stateDtype == ge::DT_FLOAT) ? 4 : 2;
         int64_t queueCoeff = (stateDtypeSize + static_cast<int64_t>(stateDtypeSize * selected.stateOutBufferNum)) * aDk +
                              static_cast<int64_t>(4 * selected.attnOutBufferNum);
+        if (tiling.hasRecords) {
+            queueCoeff += RGDR_FP32_BYTES; // recordsOutQueue_ per-vStep float
+        }
         int64_t ubRestBytes = ubSize - ubCalcCtx.fixedUbBytes - queueCoeff * static_cast<int64_t>(selected.vStep);
         if (ubRestBytes < 0) {
             OP_LOGE(ctx_.nodeName, "ubRestBytes should be non-negative, but got %ld", ubRestBytes);
@@ -432,8 +451,7 @@ private:
 
     ge::graphStatus RuleCalcVStepCoeff(RecurrentGatedDeltaRuleTilingData &tiling, UbCalcContext &ubCalcCtx) const
     {
-        (void)tiling;
-        ubCalcCtx.coeff = CalcVStepCoeff(ubCalcCtx.aDk, 1, 1);
+        ubCalcCtx.coeff = CalcVStepCoeff(ubCalcCtx.aDk, 1, 1, tiling.hasRecords);
         return ge::GRAPH_SUCCESS;
     }
 

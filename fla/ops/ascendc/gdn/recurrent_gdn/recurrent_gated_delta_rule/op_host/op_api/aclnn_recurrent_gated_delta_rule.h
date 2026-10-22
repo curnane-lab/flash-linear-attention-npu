@@ -53,6 +53,39 @@ ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
 ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRule(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                    aclrtStream stream);
 
+/**
+ * @brief Recover extension of the first-stage interface: same computation, plus the
+ * optional read-only checkpoint, the per-token records row index and the records
+ * destination.  The legacy symbol above is kept ABI-identical and behaves
+ * bit-identically; it is equivalent to calling this entry with
+ * `sourceState == nullptr`, `recordIndices == nullptr` and `records == nullptr`.
+ *
+ * @param [in] sourceState: optional read-only checkpoint [Slots, HV, V, K], same
+ *   dtype as stateRef; when null the initial state is read from `stateRef`
+ *   exactly as before.
+ * @param [in] recordIndices: optional int32 [tokens]; row index inside `records`
+ *   per token.  Distinct namespace from ssmStateIndices.  Must be provided
+ *   together with `records`.
+ * @param [out] records: optional fp32 [Nrecord, HV, T, V + K + 1], packed
+ *   `[V] correction(dc) | [K] key | 1 alpha` per (value head, local step).
+ * @param [out] 返回需要在npu device侧申请的workspace大小。
+ * @param [out] executor: 返回op执行器，包含了算子计算流程。
+ * @return aclnnStatus: 返回状态码
+ */
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta,
+    const aclTensor *sourceState, aclTensor *stateRef, const aclTensor *actualSeqLengths,
+    const aclTensor *ssmStateIndices, const aclTensor *recordIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, aclTensor *records,
+    uint64_t *workspaceSize, aclOpExecutor **executor);
+
+/**
+ * @brief Recover extension of the second-stage interface.  Same stream contract as
+ * `aclnnRecurrentGatedDeltaRule`.
+ */
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleRecover(void *workspace, uint64_t workspaceSize,
+                                                          aclOpExecutor *executor, aclrtStream stream);
+
 #ifdef __cplusplus
 }
 #endif

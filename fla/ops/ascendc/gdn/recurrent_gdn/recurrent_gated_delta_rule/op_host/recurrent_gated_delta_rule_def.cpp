@@ -69,6 +69,21 @@ public:
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        // Read-only checkpoint the initial state is read from.  Absent => the
+        // legacy behaviour reads (and overwrites) `state` itself.
+        this->Input("source_state")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_BF16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
+        // Per-token row index into `records`; a namespace distinct from
+        // ssm_state_indices.
+        this->Input("record_indices")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32, ge::DT_INT32})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
@@ -80,6 +95,12 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .IgnoreContiguous();
+        // Per (value head, step) packed record row: [V] dc | [K] key | 1 alpha.
+        this->Output("records")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(OPTIONAL).Float(1.0);
 
         OpAICoreConfig aicConfig;

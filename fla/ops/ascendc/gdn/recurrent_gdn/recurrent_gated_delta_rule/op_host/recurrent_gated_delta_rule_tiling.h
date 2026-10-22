@@ -67,12 +67,14 @@ protected:
     ge::graphStatus GetScale();
     ge::graphStatus GetStateStrides();
     ge::graphStatus GetOptionalInput();
+    ge::graphStatus GetRecoverInputs();
     ge::graphStatus AnalyzeFormat();
     bool CheckFormat(ge::Format format, const std::string &Desc);
 
     RecurrentGatedDeltaRuleCompileInfo compileInfo_;
     RecurrentGatedDeltaRuleTilingData tilingData_;
     RecurrentGatedDeltaRuleInfo inputParams_;
+    bool socIsArch35_ = false;
 };
 
 } // namespace optiling

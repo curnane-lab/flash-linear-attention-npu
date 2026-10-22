@@ -51,6 +51,13 @@ struct RGDRInitParams {
     GM_ADDR numAcceptedTokens;
     GM_ADDR attnOut;
     GM_ADDR finalState;
+    // Recover extension operands, present in the shared kernel entry signature.
+    // The arch35 (ascend950) implementation does not support them; the host
+    // tiling rejects hasSourceState/hasRecords on this SoC, so they are always
+    // null here.
+    GM_ADDR sourceState;
+    GM_ADDR recordIndices;
+    GM_ADDR records;
 };
 
 template <typename stateType, typename outType, bool hasGama, bool hasGamaK>

@@ -558,3 +558,24 @@ int main()
     return 0;
 }
 ```
+
+## Recover 扩展接口（只读 checkpoint verify + 独立 records）
+
+> 本扩展在 ascend910b / ascend910_93 上验证；ascend950（arch35 kernel）暂不支持，host tiling 会显式拒绝。
+
+在保持 `aclnnRecurrentGatedDeltaRule` 行为逐位不变的前提下，新增两段式接口
+`aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize` / `aclnnRecurrentGatedDeltaRuleRecover`，
+增加三个可选操作数：
+
+| 操作数 | 方向 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `sourceState` | 输入（可选） | 与 `stateRef` 同 dtype，`[Slots, HV, V, K]` | 只读 checkpoint：初始状态从它读出；缺省时回退为从 `stateRef` 读取（legacy 行为，逐位一致） |
+| `recordIndices` | 输入（可选） | int32 `[tokens]` | 每个 token 写入 `records` 的行号（独立于 `ssmStateIndices` 的命名空间） |
+| `records` | 输出（可选） | fp32 `[Nrecord, HV, T, V+K+1]` | 每个 (value head, step) 一行的打包记录：`[V] dc \| [K] key \| 1 alpha` |
+
+约束：`recordIndices` 与 `records` 必须成对提供；`gk`（逐 K 门控）与 `records` 不可同时使用
+（标量 alpha 记录位无法表达 per-K 门控，host tiling 显式拒绝）；`records` 最后一维必须等于
+`V+K+1`。未寻址的 `records` 行/步不会被写入。
+
+Stable-ABI 入口：`fla_npu.ops.ascendc.npu_recurrent_gated_delta_rule_recover`（torch 算子
+`fla_npu_stable::npu_recurrent_gated_delta_rule_recover`），`state` 与 `records` 原地写。

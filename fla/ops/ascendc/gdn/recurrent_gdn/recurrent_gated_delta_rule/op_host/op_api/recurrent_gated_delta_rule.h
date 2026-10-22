@@ -19,6 +19,15 @@ const aclTensor *RecurrentGatedDeltaRule(const aclTensor *query, const aclTensor
                                          const aclTensor *beta, aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                          const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
                                          const aclTensor *numAcceptedTokens, float scaleValue, aclOpExecutor *executor);
+
+// Recover variant: adds the optional read-only checkpoint (sourceState), the
+// per-token records row index (recordIndices) and the records output.  Null
+// sourceState/recordIndices/records reproduce the legacy call exactly.
+const aclTensor *RecurrentGatedDeltaRuleRecover(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta,
+    const aclTensor *sourceState, aclTensor *stateRef, const aclTensor *actualSeqLengths,
+    const aclTensor *ssmStateIndices, const aclTensor *recordIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *records, aclOpExecutor *executor);
 }
 
 #endif // PTA_NPU_OP_API_COMMON_INC_LEVEL0_OP_RECURRENT_GETED_DELTA_RULE
