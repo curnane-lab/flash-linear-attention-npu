@@ -59,19 +59,26 @@ are therefore NOT checked by the op: out-of-range indices fault the device.
 
 ## The four rules
 
-### Rule 1 — multiple requests may read the SAME read-only source — [MEASURED at page level / CONSTRAINED at row level]
+### Rule 1 — multiple requests may read the SAME read-only source — [MEASURED at page level / NOT EXPRESSIBLE at row level in v1]
 
 - Page level: several requests may read rows of one shared, read-only source
   allocation. Measured: 4 requests read rows of a single `source_state` page;
   the page is bitwise unchanged after the call and every request's output
   matches the fp64 snapshot oracle. Two concurrent calls on separate streams
   sharing one read-only source page likewise leave it bitwise unchanged.
-- Row level: several requests may read the same *row* only if no request in the
-  call writes it. With the base op, the read row of request *b* is also a write
-  slot of *b* (index coupling), so a shared read row is necessarily written by
-  each reader — it falls under rule 2 and is rejected. The row-level sharing
-  form is only expressible in the recover namespace (separate read/write
-  indices), where the shared row must be declared read-only.
+- Row level: NOT expressible in v1. The recover namespace separates the
+  source/destination *storage* and gives `records` its own index namespace,
+  but the checkpoint read row and the state write rows still share one
+  `ssm_state_indices` array: request *b* reads
+  `source_state[ssm_state_indices[stateTokenIdx_b]]` while every token *t*
+  writes `state[ssm_state_indices[t]]`. A request's read row is therefore
+  always also one of its own write slots (index coupling). The form "several
+  requests read one shared source *row* while writing disjoint destination
+  rows" cannot be expressed in a single v1 call: the shared row would land in
+  every reader's write set, so the batch falls under rule 2 and must be
+  rejected by the adapter. Lifting this restriction needs a future interface
+  change — an independent source-index operand, or a records-only mode that
+  writes no destination state.
 
 ### Rule 2 — destination write slots are mutually non-overlapping — [MEASURED]
 
@@ -116,6 +123,7 @@ then this rule is an ASSUMED guarantee, not a measured one.
 | zero-length request is a total no-op | MEASURED |
 | concurrent calls, disjoint slots, one pool: no cross-corruption | MEASURED |
 | shared read-only source page unchanged, incl. across streams | MEASURED |
+| row-level shared read with disjoint writes in one call | NOT SUPPORTED in v1 (read/write index coupling, rule 1) |
 | op launch is async; per-stream events suffice for read-back | MEASURED |
 | op is capturable/replayable with caller-owned stable buffers | MEASURED |
 | published shared page protected by engine COW / write ownership | ASSUMED |
