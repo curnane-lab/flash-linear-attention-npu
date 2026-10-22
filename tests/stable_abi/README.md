@@ -30,6 +30,7 @@ export PYTHONPATH=<env>
 | `test_input_lifetime.py` | boxed kernel 消费栈引用之后，调用方手里的输入张量必须完好、可继续读写；每轮新建输入不涨内存 | `python tests/stable_abi/test_input_lifetime.py` |
 | `regression_mutation_contract.py` | 原地更新算子的 version/grad 契约；同时提供 `gdr_inputs` / `kda_inputs` 供上一条复用 | `python tests/stable_abi/regression_mutation_contract.py` |
 | `test_stable_fallback_warning.py` | 加载不到适配层时必须告警：库缺失、库不是本适配层产物、以及正常加载三种情形，并检查降级原因写成"适配层不可用"而不是"算子没带" | `python tests/stable_abi/test_stable_fallback_warning.py --lib <so>` |
+| `test_recurrent_gdr_recover.py` | GDN recover 扩展回归：fp64 标杆数值点检（Stable-ABI 与 aclnn 双路径）、`source_state` 只读逐位保持与未写槽 sentinel、host 拒绝矩阵（source_state 内层非连续、records 步容量 < MAX_MTP=8、source/dest 存储别名、gk+records、record_indices 无 records）、mutation 契约（version 恰一次 bump、records/state grad 拒绝） | `python tests/stable_abi/test_recurrent_gdr_recover.py --device 0` |
 
 > **ctypes 对照已删除**：逐算子 ctypes↔适配层逐位 parity、场景基线
 > （`stable_scenarios.json`）、客户可见面切换（`customer_switch_compat.py`）和
