@@ -580,3 +580,6 @@ int main()
 
 Stable-ABI 入口：`fla_npu.ops.ascendc.npu_recurrent_gated_delta_rule_recover`（torch 算子
 `fla_npu_stable::npu_recurrent_gated_delta_rule_recover`），`state` 与 `records` 原地写。
+
+批量 verify 调用下 checkpoint/写入槽/records 行的共享与冲突规则（host 校验、适配层与引擎
+allocator 各自的责任边界）见 [recover_alias_contract.md](recover_alias_contract.md)。
