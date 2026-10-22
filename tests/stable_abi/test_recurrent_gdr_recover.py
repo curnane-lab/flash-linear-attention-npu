@@ -7,12 +7,15 @@ exact, independent fp64 CPU reference:
 
 1. numeric spot cases: L4/B4/H16/HV32 fp32 state, a single-token request, and
    the accepted-token read-row offset variant;
-2. read-only ``source_state`` bit preservation and the sentinel on pool slots /
+2. independent ``record_indices`` namespace: a reversed permutation shifted
+   past the state rows, one records row shared by all tokens of a request
+   (local step distinguishes), and a wrong-namespace negative control;
+3. read-only ``source_state`` bit preservation and the sentinel on pool slots /
    records rows/steps the call must not write;
-3. host-side rejections: non-contiguous ``source_state`` inner dims, undersized
+4. host-side rejections: non-contiguous ``source_state`` inner dims, undersized
    records step capacity (< MAX_MTP=8), ``source_state``/``state`` storage
    aliasing, ``gk``+``records`` pairing, ``record_indices`` without ``records``;
-4. mutation contract: one call bumps the ``state`` and ``records`` version
+5. mutation contract: one call bumps the ``state`` and ``records`` version
    counters exactly once, and grad-requiring tensors are refused.
 
 Primitive-graph replay is NOT_APPLICABLE here: this harness has no
@@ -89,10 +92,12 @@ def reference_recover(q, k, v, g, beta, source, indices, record_indices,
     return out, dest, records
 
 
-def build_case(lengths, H, HV, seed=3, acc=None):
-    """One recover case on CPU.  Write slots and record rows are the first
-    T = sum(lengths) rows; the source pool has 3 trailing rows that must stay
-    untouched."""
+def build_case(lengths, H, HV, seed=3, acc=None, indices=None,
+               record_indices=None):
+    """One recover case on CPU.  Write slots default to the first
+    T = sum(lengths) rows and record rows default to the same rows (pass
+    ``indices``/``record_indices`` to exercise independent namespaces); the
+    source pool has 3 trailing rows that must stay untouched."""
     T = sum(lengths)
     gen = torch.Generator().manual_seed(seed)
     q = torch.randn(T, H, K, generator=gen)
@@ -102,10 +107,12 @@ def build_case(lengths, H, HV, seed=3, acc=None):
     v = torch.randn(T, HV, V, generator=gen)
     g = -torch.rand(T, HV, generator=gen) * 0.5
     beta = torch.rand(T, HV, generator=gen)
-    S = T + 3
+    indices = list(range(T)) if indices is None else list(indices)
+    record_indices = (list(range(T)) if record_indices is None
+                      else list(record_indices))
+    assert len(indices) == len(record_indices) == T
+    S = max(indices) + 4
     source = torch.randn(S, HV, V, K, generator=gen) * 0.2
-    indices = list(range(T))
-    record_indices = list(range(T))
     scale = K ** -0.5
     ref_out, ref_dest, ref_records = reference_recover(
         q.to(torch.bfloat16).double(), k.to(torch.bfloat16).double(),
@@ -134,8 +141,9 @@ def to_dev(case, device):
          "ridx": torch.tensor(case["record_indices"], dtype=torch.int32,
                               device=device),
          "records": torch.full(
-             (case["T"] + 2, case["HV"], max(max(case["lengths"]), MAX_MTP),
-              V + K + 1), SENTINEL, dtype=torch.float32, device=device),
+             (max(case["record_indices"]) + 3, case["HV"],
+              max(max(case["lengths"]), MAX_MTP), V + K + 1), SENTINEL,
+             dtype=torch.float32, device=device),
          "acc": None if case["accepted"] is None else torch.tensor(
              [case["accepted"]] * len(case["lengths"]), dtype=torch.int32,
              device=device),
@@ -202,31 +210,26 @@ def check_numeric(name, case, d, out):
     off = 0
     for L in case["lengths"]:
         for i in range(L):
-            kref[off + i, :, i, :] = kb[off + i][kidx].double()
+            t = off + i
+            kref[case["record_indices"][t], :, i, :] = kb[t][kidx].double()
         off += L
     mask = ~torch.isnan(kref)
     key_exact = bool((rec[..., V:V + K][mask] == kref[mask].float()).all().item())
     ok &= key_exact
     rel_alpha = rel(rec[..., V + K][cell_mask], ref[..., V + K][cell_mask])
     ok &= rel_alpha < TOL_ALPHA
-    addr = sorted(set(case["record_indices"]))
-    rows_ok = all(bool((rec_full[r] == SENTINEL).all())
-                  for r in range(rec_full.shape[0]) if r not in addr)
-    steps_ok = True
-    off = 0
-    for L in case["lengths"]:
-        for i in range(L):
-            t = off + i
-            for j in range(rec_full.shape[2]):
-                if j != i:
-                    steps_ok &= bool((rec_full[t, :, j, :] == SENTINEL).all())
-        off += L
-    ok &= rows_ok and steps_ok
+    # Every device cell the reference leaves unwritten (NaN) must still hold
+    # the sentinel: rows outside the record namespace, unused steps inside a
+    # written row, and the slack rows alike.
+    untouched = torch.ones(rec_full.shape, dtype=torch.bool)
+    untouched[:ref.shape[0], :, :ref.shape[2], :] = torch.isnan(ref)
+    records_untouched = bool((rec_full[untouched] == SENTINEL).all().item())
+    ok &= records_untouched
     report(name, ok,
            f"rel_out={rel_out:.3e} rel_dest={rel_dest:.3e} rel_dc={rel_dc:.3e} "
            f"key_exact={key_exact} rel_alpha={rel_alpha:.3e} "
            f"source_bit={source_bit} dest_untouched={dest_untouched} "
-           f"records_untouched={rows_ok and steps_ok}")
+           f"records_untouched={records_untouched}")
 
 
 def expect_reject(name, fn, needle=None):
@@ -249,6 +252,57 @@ def scenario_numeric(device):
             check_numeric(f"numeric {tag} [{path}]", case, d, runner(case, d))
             del d
             torch.npu.empty_cache()
+
+
+def scenario_record_namespace(device):
+    """records rows live in their own index namespace, independent of the
+    state write slots (review item: the old cases used record_indices ==
+    indices == range(T), so a kernel writing records at the state rows would
+    still have passed)."""
+    # (a) record rows are a reversed permutation shifted past the state rows:
+    # disjoint from, and differently ordered than, the write slots.
+    T = 16
+    case = build_case([4, 4, 4, 4], 16, 32, seed=51,
+                      record_indices=[2 * T - 1 - t for t in range(T)])
+    for path, runner in (("stable", run_stable), ("aclnn", run_aclnn)):
+        d = to_dev(case, device)
+        check_numeric(f"numeric permuted-records [{path}]", case, d,
+                      runner(case, d))
+        del d
+        torch.npu.empty_cache()
+
+    # (b) every token of a request shares one records row; the local step
+    # distinguishes them (the request-slot consumption shape).
+    case = build_case([4, 4], 16, 32, seed=52,
+                      record_indices=[0, 0, 0, 0, 1, 1, 1, 1])
+    for path, runner in (("stable", run_stable), ("aclnn", run_aclnn)):
+        d = to_dev(case, device)
+        check_numeric(f"numeric shared-record-row [{path}]", case, d,
+                      runner(case, d))
+        del d
+        torch.npu.empty_cache()
+
+    # (c) negative control: recompute the reference with the WRONG namespace
+    # (state rows used as record rows).  The device records must NOT match it;
+    # if they did, the kernel (or the harness) would be confusing the two
+    # namespaces and this suite must say so.
+    case = build_case([4, 4, 4, 4], 16, 32, seed=51,
+                      record_indices=[2 * T - 1 - t for t in range(T)])
+    d = to_dev(case, device)
+    run_stable(case, d)
+    wrong_ref = reference_recover(
+        case["q"].to(torch.bfloat16).double(),
+        case["k"].to(torch.bfloat16).double(),
+        case["v"].to(torch.bfloat16).double(), case["g"].double(),
+        case["beta"].to(torch.bfloat16).double(), case["source"].double(),
+        case["indices"], case["indices"], case["lengths"], case["scale"],
+        dest_slots=case["S"])
+    wrong = wrong_ref[2]
+    rec = d["records"].cpu()[:wrong.shape[0], :, :wrong.shape[2], :]
+    cell_mask = ~torch.isnan(wrong[..., V + K])
+    rel_wrong = rel(rec[..., :V][cell_mask], wrong[..., :V][cell_mask])
+    report("negative control: wrong-namespace reference mismatches device",
+           rel_wrong > 10 * TOL_DC, f"rel_dc_wrong={rel_wrong:.3e}")
 
 
 def scenario_rejections(device):
@@ -386,6 +440,7 @@ def main():
     device = f"npu:{args.device}"
 
     scenario_numeric(device)
+    scenario_record_namespace(device)
     scenario_rejections(device)
     scenario_mutation_contract(device)
     print("NOT_APPLICABLE primitive-graph replay: no graph-capture facility "
