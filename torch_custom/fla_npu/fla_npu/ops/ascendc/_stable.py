@@ -616,6 +616,18 @@ def npu_recurrent_gated_delta_rule_recover(
                 "npu_recurrent_gated_delta_rule_recover: source_state last two "
                 "dims must be contiguous (stride(-1)==1, stride(-2)==K); make "
                 "the checkpoint tensor contiguous before calling.")
+    if records is not None and records.dim() == 4 and records.shape[2] < 8:
+        # Frozen v1 capacity contract, same as the aclnn/tiling check: the
+        # kernel writes local steps [0, seqLen) of each request into dim 2 and
+        # the per-request window is capped at MAX_MTP=8, so dim 2 must hold
+        # the maximum window -- a smaller one lets a step write spill into the
+        # next head's row (and past the last head, out of bounds).  The
+        # per-request lengths themselves stay the caller/adapter's
+        # responsibility (device tensor values are never read on the host).
+        raise RuntimeError(
+            "npu_recurrent_gated_delta_rule_recover: records dim 2 "
+            "(per-request step capacity) must be >= MAX_MTP=8, got "
+            f"{records.shape[2]}.")
 
     if state is not None and state.requires_grad:
         _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", state)

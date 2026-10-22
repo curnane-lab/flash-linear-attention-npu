@@ -463,6 +463,22 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetRecoverInputs()
                             "records dims must be [Nrecord, NV=%u, L, DV+DK+1=%u]", tilingData_.nv,
                             tilingData_.dv + tilingData_.dk + 1),
                     return ge::GRAPH_FAILED);
+        // Frozen v1 capacity contract: the kernel writes local steps
+        // [0, seqLen) of each request at records[.., .., step, ..], and a
+        // per-request window is capped at RGDR_MAX_MTP (a longer request makes
+        // the kernel return without writing anything).  The host never reads
+        // device tensor values (no D2H), so the actual per-request lengths --
+        // and the validity of the record_indices/ssm_state_indices values
+        // themselves -- stay the caller/adapter's responsibility; what the
+        // formal entry freezes is the step capacity: records dim 2 must hold
+        // the maximum window a launch can ever write.  A smaller dim 2 lets a
+        // step write spill into the next head's row (and past the last head,
+        // out of bounds).
+        OP_CHECK_IF(recShape.GetDim(2) < static_cast<int64_t>(RGDR_MAX_MTP),
+                    OP_LOGE(context_->GetNodeName(),
+                            "records dim 2 (per-request step capacity) must be >= MAX_MTP=%zu, got %ld",
+                            RGDR_MAX_MTP, static_cast<long>(recShape.GetDim(2))),
+                    return ge::GRAPH_FAILED);
         tilingData_.hasRecords = 1;
         auto recStride = context_->GetOutputStride(RECORDS_OUTPUT_INDEX);
         if (recStride != nullptr && recStride->GetDimNum() == RGDR_STATE_DIM_NUM) {

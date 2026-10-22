@@ -41,6 +41,11 @@ constexpr size_t KEY_DIM_NUM = 3;
 constexpr size_t VALUE_DIM_NUM = 3;
 constexpr size_t BETA_DIM_NUM = 2;
 constexpr size_t STATE_DIM_NUM = 4;
+// Frozen v1 recover contract: the largest per-request window the kernel can
+// write into records (RGDR_MAX_MTP in the tiling/kernel; a longer request
+// makes the kernel return without writing).  records dim 2 must hold it --
+// see CheckRecoverRecordsCapacity.
+constexpr int64_t RECOVER_MAX_WINDOW = 8;
 
 struct RecurrentGatedDeltaRuleParams {
     // madatory
@@ -341,6 +346,33 @@ static inline bool CheckSourceStateLayoutRecover(const RecurrentGatedDeltaRuleRe
     }
     return true;
 }
+
+static inline bool CheckRecoverRecordsCapacity(const RecurrentGatedDeltaRuleRecoverParams &params)
+{
+    if (params.records == nullptr) {
+        return true;
+    }
+    // The kernel writes local steps [0, seqLen) of each request at
+    // records[.., .., step, ..].  The host cannot read the per-request lengths
+    // (device tensor values are the caller/adapter's responsibility, no D2H),
+    // so the formal entry freezes the step capacity at the maximum window a
+    // launch can ever write (RECOVER_MAX_WINDOW == the kernel's MAX_MTP): a
+    // smaller dim 2 lets a step write spill into the next head's row, and past
+    // the last head out of bounds.  The tiling layer repeats this check for
+    // callers that bypass aclnn.
+    const auto &recShape = params.records->GetViewShape();
+    if (recShape.GetDimNum() != STATE_DIM_NUM) {
+        // Rank mismatches are reported by the tiling shape check.
+        return true;
+    }
+    if (recShape.GetDim(2) < RECOVER_MAX_WINDOW) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID,
+                "records dim 2 (per-request step capacity) must be >= MAX_MTP=%ld, got %ld",
+                static_cast<long>(RECOVER_MAX_WINDOW), static_cast<long>(recShape.GetDim(2)));
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
@@ -365,6 +397,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
     CHECK_RET(CheckNotNullRecover(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckDtypeVaildRecover(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckSourceStateLayoutRecover(params), ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(CheckRecoverRecordsCapacity(params), ACLNN_ERR_PARAM_INVALID);
     auto ret = PreProcessRecover(params);
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
 
