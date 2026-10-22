@@ -605,6 +605,17 @@ def npu_recurrent_gated_delta_rule_recover(
         raise RuntimeError(
             "npu_recurrent_gated_delta_rule_recover: records are not supported "
             "together with gk (per-K gate): the alpha record field is scalar.")
+    if source_state is not None and source_state.dim() == 4:
+        # Same layout contract the aclnn entry and the tiling enforce: the
+        # kernel reads source_state as contiguous V x K blocks, so a permuted
+        # inner pair (V and K are both 128, the shape survives a transpose)
+        # must be rejected here rather than read back as the wrong matrix.
+        if (source_state.stride(-1) != 1
+                or source_state.stride(-2) != source_state.shape[-1]):
+            raise RuntimeError(
+                "npu_recurrent_gated_delta_rule_recover: source_state last two "
+                "dims must be contiguous (stride(-1)==1, stride(-2)==K); make "
+                "the checkpoint tensor contiguous before calling.")
 
     if state is not None and state.requires_grad:
         _refuse_grad_state("npu_recurrent_gated_delta_rule_recover", state)

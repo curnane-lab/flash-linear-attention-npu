@@ -313,6 +313,34 @@ static aclnnStatus PreProcessRecover(RecurrentGatedDeltaRuleRecoverParams &param
 
     return ACLNN_SUCCESS;
 }
+
+static inline bool CheckSourceStateLayoutRecover(const RecurrentGatedDeltaRuleRecoverParams &params)
+{
+    if (params.source_state == nullptr) {
+        return true;
+    }
+    // The kernel reads source_state as contiguous V x K blocks (PrefetchState
+    // copies a whole head row in one shot), so only the outer two dims may
+    // carry a non-trivial stride.  A permuted inner pair (DV and DK are both
+    // 128) keeps the 4-dim shape but would be read back as the wrong matrix,
+    // so the layout is rejected here rather than materialised or misread.
+    // The tiling layer repeats this check for callers that bypass aclnn.
+    const auto &strides = params.source_state->GetViewStrides();
+    if (strides.size() != STATE_DIM_NUM) {
+        // Rank mismatches are reported by the tiling shape check.
+        return true;
+    }
+    const int64_t dk = params.state->GetViewShape().GetDim(STATE_DIM_NUM - 1);
+    if (strides[STATE_DIM_NUM - 1] != 1 || strides[STATE_DIM_NUM - 2] != dk) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID,
+                "source_state last two dims must be contiguous (stride(-1)==1, stride(-2)==DK=%ld), "
+                "got stride(-1)=%ld stride(-2)=%ld",
+                static_cast<long>(dk), static_cast<long>(strides[STATE_DIM_NUM - 1]),
+                static_cast<long>(strides[STATE_DIM_NUM - 2]));
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
@@ -336,6 +364,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
 
     CHECK_RET(CheckNotNullRecover(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckDtypeVaildRecover(params), ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(CheckSourceStateLayoutRecover(params), ACLNN_ERR_PARAM_INVALID);
     auto ret = PreProcessRecover(params);
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
 
@@ -358,8 +387,8 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleRecoverGetWorkspaceSize(
         recordIndices = l0op::Contiguous(recordIndices, uniqueExecutor.get());
     }
     // source_state is declared IgnoreContiguous like state: keep its view so the
-    // host tiling sees its strides (last two dims must be contiguous; the tiling
-    // layer and the adapter are responsible for that constraint).
+    // host tiling sees its strides (the last-two-dims contiguity contract is
+    // enforced above in CheckSourceStateLayoutRecover and again in the tiling).
     if (sourceState != nullptr && !IsContiguous(sourceState)) {
         sourceState = uniqueExecutor.get()->CreateView(
             sourceState,

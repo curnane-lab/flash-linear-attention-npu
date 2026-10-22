@@ -413,6 +413,19 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetRecoverInputs()
         tilingData_.hasSourceState = 1;
         auto srcStride = context_->GetInputStride(SOURCE_STATE_INDEX);
         if (srcStride != nullptr && srcStride->GetDimNum() == RGDR_STATE_DIM_NUM) {
+            // The kernel reads source_state as contiguous V x K blocks
+            // (PrefetchState copies a whole head row in one shot), so only the
+            // outer two dims may carry a non-trivial stride.  A permuted inner
+            // pair (DV, DK are both 128) keeps the shape but would be read as
+            // the wrong matrix -- reject it instead of silently misreading.
+            OP_CHECK_IF(srcStride->GetStride(RGDR_DIM_3) != 1 ||
+                            srcStride->GetStride(RGDR_DIM_2) != static_cast<int64_t>(tilingData_.dk),
+                        OP_LOGE(context_->GetNodeName(),
+                                "source_state last two dims must be contiguous (stride(-1)==1, stride(-2)==DK=%u), "
+                                "got stride(-1)=%ld stride(-2)=%ld",
+                                tilingData_.dk, static_cast<long>(srcStride->GetStride(RGDR_DIM_3)),
+                                static_cast<long>(srcStride->GetStride(RGDR_DIM_2))),
+                        return ge::GRAPH_FAILED);
             tilingData_.sourceStateStride0 = srcStride->GetStride(0);
             tilingData_.sourceStateStride1 = srcStride->GetStride(1);
             tilingData_.sourceStateStride2 = srcStride->GetStride(2);
