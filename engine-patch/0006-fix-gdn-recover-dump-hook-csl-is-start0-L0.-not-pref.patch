@@ -1,0 +1,49 @@
+From 76f9f0e9175aed458609716854439de4dce18cb6 Mon Sep 17 00:00:00 2001
+From: curnane-lab <curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:22:20 +0000
+Subject: [PATCH 6/6] =?UTF-8?q?fix(gdn):=20recover=20dump=20hook=20?=
+ =?UTF-8?q?=E2=80=94=20csl=20is=20[start0,=20L0..],=20not=20prefix=20offse?=
+ =?UTF-8?q?ts?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The kernel accumulates request starts itself (cuSeqlens[0] is request 0's
+start, cuSeqlens[b+1] is request b's LENGTH); the dump hook misread it as
+exclusive prefix offsets and snapshotted the wrong pre-call read rows for
+requests b>=2.  Debug/dump path only; no production semantics change.
+
+Signed-off-by: curnane-lab <curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/ops/gdn_recover.py | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+index e8d76c3..5d26957 100644
+--- a/vllm_ascend/ops/gdn_recover.py
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -195,12 +195,18 @@ def recurrent_gated_delta_rule_recover_verify(
+         # The oracle needs the PRE-call read-row states; snapshot them before
+         # the launch (debug path only, eager runs only -- under graph capture
+         # this call site runs once, at capture time).
++        # csl layout (kernel contract, op_kernel L187-200): element 0 is
++        # request 0's start offset, elements 1..B are the per-request
++        # LENGTHS (NOT exclusive prefix offsets); the kernel accumulates
++        # starts itself.
+         csl_l = actual_seq_lengths.cpu().tolist()
+         acc_l = num_accepted.cpu().tolist()
+         idx_l = ssm_state_indices.cpu().tolist()
+-        read_rows = [
+-            idx_l[csl_l[b] + acc_l[b] - 1] for b in range(len(acc_l))
+-        ]
++        read_rows = []
++        start = csl_l[0]
++        for b, acc_b in enumerate(acc_l):
++            read_rows.append(idx_l[start + acc_b - 1])
++            start += csl_l[b + 1]
+         dump_pre = {
+             "pre_state_rows": ssm_state[read_rows].cpu().clone(),
+             "read_rows": read_rows,
+-- 
+2.34.1
+

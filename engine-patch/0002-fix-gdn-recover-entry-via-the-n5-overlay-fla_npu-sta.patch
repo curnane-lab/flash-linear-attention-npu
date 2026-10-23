@@ -1,0 +1,46 @@
+From 5270c5e14635a048f20ed8ed620a7b6a303b589d Mon Sep 17 00:00:00 2001
+From: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:16:27 +0000
+Subject: [PATCH 2/6] fix(gdn): recover entry via the n5 overlay fla_npu stack
+
+The R1 OPP cannot share the CANN operator registry with the wheel OPP in
+either precedence order (probed on 910B3: n5-first faults the wheel opapi's
+stock-op launch with 507057; wheel-first makes the recover GetWorkspace miss
+its RecurrentGatedDeltaRule bin, aclnn 561103 -- and with the overlay python
+package it silently runs with wrong records). The recover arm therefore runs
+the whole fla_npu stack from the n5 overlay (n9's environment): overlay
+package first on PYTHONPATH, FLA_NPU_STABLE_LIB for the R1 stable launcher,
+n5 OPP first in ASCEND_CUSTOM_OPP_PATH. The adapter drops the private
+runtime and calls the plain fla_npu _runtime.call_aclnn path.
+
+Signed-off-by: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/ops/gdn_recover.py | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+index e7c36b6..b359ece 100644
+--- a/vllm_ascend/ops/gdn_recover.py
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -24,6 +24,18 @@ Contract notes (gdn recover operator, R1-fixed):
+     contract/verification only; the engine does not consume them.
+   * ``num_accepted_tokens`` is clamped into [1, num_spec+1] before launch:
+     0/-1/>L are silent no-ops in the operator.
++
++The recover aclnn entry is absent from the installed ``fla_npu`` package's
++opapi, and the R1 OPP cannot share the CANN operator registry with the wheel
++OPP in either precedence order (n5-first: the stock op's launch faults on the
++host-side shadowing; wheel-first: the recover op's internal bin lookup for
++``RecurrentGatedDeltaRule`` misses).  The recover arm therefore runs with the
++n5 overlay package (``n5/pylib``) ahead of site-packages on PYTHONPATH, the
++R1 Stable-ABI launcher via ``FLA_NPU_STABLE_LIB``, and the n5 OPP first in
++``ASCEND_CUSTOM_OPP_PATH`` -- exactly the n9 environment.  Legacy-op kernels
++in the n5 build are bit-identical to the wheel (n5 proof), so the remaining
++arm difference besides the operator swap is the overlay's python glue; the
++``stock_overlay`` control arm isolates that.
+ """
+ 
+ import ctypes
+-- 
+2.34.1
+

@@ -1,0 +1,385 @@
+From 75a18764d0758ee2a6b8336d0b59898538dc9daf Mon Sep 17 00:00:00 2001
+From: curnane-lab <curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:55:54 +0000
+Subject: [PATCH 5/6] feat(gdn): recover startup capability probe, records dump
+ hook, phase ledger
+
+- assert_recover_capability(): before any graph capture, run a fixed
+  on-device case (permuted + request-shared record rows) and check the
+  effective records cells against an fp64 CPU reference (key bit-exact,
+  dc/alpha within the frozen tolerances), untouched-row sentinels, and
+  bitwise out/state parity with the stock entry.  Any mismatch raises and
+  refuses startup: with the wheel OPP ahead of the R1 OPP the recover entry
+  launches but writes wrong records (N10), so symbol resolution alone is not
+  sufficient.  recover_available() now runs the probe.
+- VLLM_ASCEND_GDN_RECOVER_DUMP=<dir>: dump every verify call's inputs,
+  pre-call read-row states and the records snapshot for offline oracle
+  checks (eager mode only; under graph capture the python call site runs
+  once, at capture time).
+- Bucket the private-runtime launch counters by phase (pre_capture /
+  capture / post_capture_eager) and expose them in workspace_report().
+
+Signed-off-by: curnane-lab <curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/envs.py            |   7 +
+ vllm_ascend/ops/gdn_recover.py | 261 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 266 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 992d2e3..6d965f1 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -92,6 +92,13 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # workspace. Default: 0 (disabled). Valid values: 0 or 1. Not sensitive.
+     # Requires ASCEND_CUSTOM_OPP_PATH to carry the recover kernel binaries.
+     "VLLM_ASCEND_GDN_RECOVER": lambda: os.getenv("VLLM_ASCEND_GDN_RECOVER", "0") == "1",
++    # Experimental: directory for per-call records dumps of the GDN recover
++    # verify path (eager mode only -- under graph capture the python call site
++    # runs once, at capture time). Each verify call saves its inputs and the
++    # records pool snapshot for offline oracle checks. Default: "" (disabled).
++    # Valid values: any writable directory path. Not sensitive.
++    "VLLM_ASCEND_GDN_RECOVER_DUMP": lambda: os.getenv(
++        "VLLM_ASCEND_GDN_RECOVER_DUMP", ""),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+index 4533c78..e8d76c3 100644
+--- a/vllm_ascend/ops/gdn_recover.py
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -18,6 +18,14 @@ Contract notes (gdn recover operator, R1-fixed):
+     contract/verification only; the engine does not consume them.
+   * ``num_accepted_tokens`` is clamped into [1, num_spec+1] before launch:
+     0/-1/>L are silent no-ops in the operator.
++  * Startup probe: ``configure_workspace`` runs ``assert_recover_capability``
++    (a fixed on-device case whose records are checked against an fp64 CPU
++    reference) before any graph capture; startup is refused on mismatch
++    instead of risking the wheel-first silent-wrong records mode.
++  * Debug: ``VLLM_ASCEND_GDN_RECOVER_DUMP=<dir>`` dumps every verify call's
++    inputs (incl. pre-call read-row states) and records snapshot for offline
++    oracle checks.  Eager mode only -- under graph capture the python call
++    site runs once, at capture time.
+ 
+ OPP/opapi consistency (measured on 910B3, N10 probes): the R1 OPP carries
+ only the RecurrentGatedDeltaRule family, and its host-side registration
+@@ -90,11 +98,17 @@ def _rgdr_runtime():
+ 
+ 
+ def recover_available() -> bool:
+-    """Whether the recover aclnn entry resolves against the R1 opapi build."""
++    """Whether the recover entry resolves AND passes the capability probe.
++
++    Symbol resolution alone is insufficient (the wheel-first OPP ordering
++    launches but writes wrong records), so this runs the device probe.
++    """
+     if not recover_enabled():
+         return False
+     try:
+         _rgdr_runtime()
++        assert_recover_capability(
++            torch.device(f"npu:{torch.npu.current_device()}"))
+         return True
+     except Exception:
+         return False
+@@ -109,6 +123,7 @@ def _call_rgdr(entry, build, out):
+ 
+     aclnn_runtime = _rgdr_runtime()
+     CALLS[entry] += 1
++    CALLS_PHASE[entry][_call_phase()] += 1
+     device = _call_device((out,))
+     ctx = _CallContext(aclnn_runtime, device)
+     with _npu_device_guard(device):
+@@ -120,6 +135,37 @@ def _call_rgdr(entry, build, out):
+     return out
+ 
+ 
++_DUMP_COUNTER = 0
++
++
++def _maybe_dump(records: torch.Tensor, tensors: dict) -> None:
++    """Per-call records dump for offline oracle checks (eager mode only).
++
++    Under graph capture the python call site runs once, at capture time, so a
++    dump directory only makes sense with an eager run; this is documented in
++    envs.py next to VLLM_ASCEND_GDN_RECOVER_DUMP.
++    """
++    global _DUMP_COUNTER
++    dump_dir = envs.VLLM_ASCEND_GDN_RECOVER_DUMP
++    if not dump_dir:
++        return
++    os.makedirs(dump_dir, exist_ok=True)
++    layer = next((n for n, p in _RECORDS_POOLS.items() if p is records),
++                 "unknown")
++    torch.npu.synchronize()
++    payload = {
++        name: (t.cpu() if torch.is_tensor(t) else t)
++        for name, t in tensors.items()
++    }
++    payload["records"] = records.cpu()
++    torch.save(
++        payload,
++        os.path.join(
++            dump_dir,
++            f"call_{_DUMP_COUNTER:05d}_{layer.replace('.', '_')}.pt"))
++    _DUMP_COUNTER += 1
++
++
+ def recurrent_gated_delta_rule_recover_verify(
+     query: torch.Tensor,
+     key: torch.Tensor,
+@@ -144,6 +190,22 @@ def recurrent_gated_delta_rule_recover_verify(
+     num_accepted = num_accepted_tokens.to(torch.int32).clamp(1, max_window)
+     out = torch.empty_like(value)
+ 
++    dump_pre = None
++    if envs.VLLM_ASCEND_GDN_RECOVER_DUMP:
++        # The oracle needs the PRE-call read-row states; snapshot them before
++        # the launch (debug path only, eager runs only -- under graph capture
++        # this call site runs once, at capture time).
++        csl_l = actual_seq_lengths.cpu().tolist()
++        acc_l = num_accepted.cpu().tolist()
++        idx_l = ssm_state_indices.cpu().tolist()
++        read_rows = [
++            idx_l[csl_l[b] + acc_l[b] - 1] for b in range(len(acc_l))
++        ]
++        dump_pre = {
++            "pre_state_rows": ssm_state[read_rows].cpu().clone(),
++            "read_rows": read_rows,
++        }
++
+     def build(ctx):
+         return [
+             ctx.tensor(query, "query"),
+@@ -163,7 +225,23 @@ def recurrent_gated_delta_rule_recover_verify(
+             ctx.tensor(records, "records"),
+         ]
+ 
+-    return _call_rgdr(ENTRY_NAME, build, out)
++    out = _call_rgdr(ENTRY_NAME, build, out)
++    if dump_pre is not None:
++        _maybe_dump(records, {
++            "query": query,
++            "key": key,
++            "value": value,
++            "g": g,
++            "beta": beta,
++            "scale": scale,
++            "actual_seq_lengths": actual_seq_lengths,
++            "ssm_state_indices": ssm_state_indices,
++            "num_accepted_tokens": num_accepted,
++            "record_indices": record_indices,
++            "out": out,
++            **dump_pre,
++        })
++    return out
+ 
+ 
+ def recurrent_gated_delta_rule_stock(
+@@ -219,6 +297,27 @@ FALLBACKS: dict[str, int] = {"no_pool": 0, "nonuniform_window": 0,
+                              "mixed_batch": 0}
+ # Launch counts through the private runtime, by entry (proof of execution).
+ CALLS: dict[str, int] = {ENTRY_NAME: 0, STOCK_ENTRY_NAME: 0}
++# Same launches bucketed by phase: "pre_capture" (warmup / eager steps before
++# the first graph capture), "capture" (calls recorded into a graph),
++# "post_capture_eager" (python-visible calls after a capture happened, i.e.
++# steps that fell back out of the captured path).  Graph replays do not enter
++# python and are therefore never counted here.
++CALLS_PHASE: dict[str, dict[str, int]] = {
++    ENTRY_NAME: {"pre_capture": 0, "capture": 0, "post_capture_eager": 0},
++    STOCK_ENTRY_NAME: {"pre_capture": 0, "capture": 0, "post_capture_eager": 0},
++}
++_CAPTURE_SEEN = False
++
++
++def _call_phase() -> str:
++    global _CAPTURE_SEEN
++    try:
++        if torch.npu.is_current_stream_capturing():
++            _CAPTURE_SEEN = True
++            return "capture"
++    except Exception:
++        pass
++    return "post_capture_eager" if _CAPTURE_SEEN else "pre_capture"
+ 
+ 
+ def configure_workspace(
+@@ -257,6 +356,10 @@ def configure_workspace(
+         // window
+     )
+     _RECORD_WINDOW = window
++    # Startup capability probe: prove on device that the recover entry writes
++    # correct records before any graph capture (wheel-first OPP ordering
++    # launches but writes wrong records -- refuse startup instead).
++    assert_recover_capability(device)
+ 
+ 
+ def get_records_pool(layer_name: str) -> torch.Tensor | None:
+@@ -284,6 +387,158 @@ def records_sentinel_ok(pool: torch.Tensor) -> bool:
+     return bool((pool[-1] == RECORD_SENTINEL).all())
+ 
+ 
++# Startup capability probe ---------------------------------------------------
++#
++# Symbol resolution alone is NOT sufficient: with the wheel OPP ahead of the
++# R1 OPP in ASCEND_CUSTOM_OPP_PATH the recover entry has been observed to
++# launch successfully while writing wrong records (N10 probe history).  The
++# probe below runs a fixed small case through the private runtime before any
++# graph capture and checks the effective records cells against an fp64 CPU
++# reference, the untouched-row sentinels, and bitwise out/state parity with
++# the stock entry of the same runtime.  Any mismatch refuses startup.
++
++_PROBE_PASSED = False
++
++_TOL_PROBE_OUT = 5e-3
++_TOL_PROBE_STATE = 1e-3
++_TOL_PROBE_DC = 1e-3
++_TOL_PROBE_ALPHA = 1e-5
++
++_OPP_HINT = ("the recover entry is known to launch but write wrong records "
++             "when the wheel OPP precedes the R1 (recover-capable) OPP in "
++             "ASCEND_CUSTOM_OPP_PATH; put the R1 OPP first")
++
++
++def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
++    return float((a.double() - b.double()).norm()
++                 / b.double().norm().clamp_min(1e-12))
++
++
++def _probe_reference(q, k, v, g, beta, state0, indices, record_indices,
++                     lengths, scale, accepted):
++    """fp64 CPU reference for the probe case (delta-rule recurrence)."""
++    T = q.shape[0]
++    H, HV = q.shape[1], v.shape[1]
++    V = v.shape[-1]
++    kidx = [hv // (HV // H) for hv in range(HV)]
++    out = torch.zeros(T, HV, V, dtype=torch.float64)
++    dest = state0.clone()
++    records: dict[int, dict[int, tuple]] = {}
++    off = 0
++    for b, L in enumerate(lengths):
++        M = state0[int(indices[off + accepted[b] - 1])].clone()
++        for i in range(L):
++            t = off + i
++            a = g[t].exp().view(HV, 1)
++            kk = k[t][kidx]
++            dc = beta[t].view(HV, 1) * (v[t] - a * torch.einsum(
++                "hvk,hk->hv", M, kk))
++            M = a.view(HV, 1, 1) * M + torch.einsum("hv,hk->hvk", dc, kk)
++            out[t] = torch.einsum("hvk,hk->hv", M, q[t][kidx]) * scale
++            dest[int(indices[t])] = M
++            records.setdefault(int(record_indices[t]), {})[i] = (
++                dc, kk, a.view(HV))
++        off += L
++    return out, dest, records
++
++
++def assert_recover_capability(device) -> None:
++    """Prove the recover entry computes correct records, or refuse startup."""
++    global _PROBE_PASSED
++    if _PROBE_PASSED:
++        return
++    gen = torch.Generator().manual_seed(20261022)
++    H, HV, K, V = 2, 4, 128, 128
++    lengths = [4, 2, 4]
++    T = sum(lengths)
++    scale = K ** -0.5
++    q = torch.randn(T, H, K, generator=gen)
++    k = torch.randn(T, H, K, generator=gen)
++    q = q / q.norm(dim=-1, keepdim=True)
++    k = k / k.norm(dim=-1, keepdim=True)
++    v = torch.randn(T, HV, V, generator=gen)
++    g = -torch.rand(T, HV, generator=gen) * 0.5
++    beta = torch.rand(T, HV, generator=gen)
++    indices = [1, 1, 1, 1, 2, 2, 3, 3, 3, 3]
++    record_indices = [2, 2, 2, 2, 0, 0, 5, 5, 5, 5]
++    accepted = [3, 2, 1]
++    # Non-contiguous, request-shared record rows on purpose: the probe must
++    # exercise the record-row namespace, not just range(T).
++    untouched_rows = [0, 4, 5, 6, 7]
++    state0 = torch.randn(8, HV, V, K, generator=gen) * 0.2
++    state0[untouched_rows] = RECORD_SENTINEL
++
++    q_d, k_d = q.to(torch.bfloat16).to(device), k.to(torch.bfloat16).to(device)
++    v_d = v.to(torch.bfloat16).to(device)
++    g_d = g.float().to(device)
++    beta_d = beta.to(torch.bfloat16).to(device)
++
++    ref_out, ref_dest, ref_records = _probe_reference(
++        q_d.cpu().double(), k_d.cpu().double(), v_d.cpu().double(),
++        g_d.cpu().double(), beta_d.cpu().double(), state0.double(),
++        indices, record_indices, lengths, scale, accepted)
++
++    csl = torch.tensor([0] + lengths, dtype=torch.int32, device=device)
++    idx = torch.tensor(indices, dtype=torch.int32, device=device)
++    ridx = torch.tensor(record_indices, dtype=torch.int32, device=device)
++    acc = torch.tensor(accepted, dtype=torch.int32, device=device)
++    records_rows = max(record_indices) + 2
++    records = torch.full((records_rows, HV, MAX_MTP_WINDOW, V + K + 1),
++                         RECORD_SENTINEL, dtype=torch.float32, device=device)
++
++    def fail(detail):
++        raise RuntimeError(
++            f"gdn recover capability probe failed: {detail}; {_OPP_HINT}")
++
++    state = state0.float().to(device).contiguous()
++    out = recurrent_gated_delta_rule_recover_verify(
++        q_d, k_d, v_d, state, g=g_d, beta=beta_d, scale=scale,
++        actual_seq_lengths=csl, ssm_state_indices=idx, num_accepted_tokens=acc,
++        record_indices=ridx, records=records, max_window=max(lengths))
++    torch.npu.synchronize()
++
++    if _rel(out.cpu(), ref_out) >= _TOL_PROBE_OUT:
++        fail(f"out rel { _rel(out.cpu(), ref_out):.3e } >= {_TOL_PROBE_OUT}")
++    for row in (1, 2, 3):
++        r = _rel(state.cpu()[row], ref_dest[row])
++        if r >= _TOL_PROBE_STATE:
++            fail(f"dest row {row} rel {r:.3e} >= {_TOL_PROBE_STATE}")
++    if not bool((state.cpu()[untouched_rows] == RECORD_SENTINEL).all()):
++        fail("untouched state pool rows were modified")
++
++    rec = records.cpu()
++    for row, steps in ref_records.items():
++        for i, (dc, kk, a) in steps.items():
++            if not bool((rec[row, :, i, V:V + K] == kk.float()).all()):
++                fail(f"records row {row} step {i} key field not bit-exact")
++            if _rel(rec[row, :, i, :V], dc) >= _TOL_PROBE_DC:
++                fail(f"records row {row} step {i} dc mismatch")
++            if _rel(rec[row, :, i, V + K], a.view(HV)) >= _TOL_PROBE_ALPHA:
++                fail(f"records row {row} step {i} alpha mismatch")
++    written_rows = set(ref_records)
++    for row in range(records_rows):
++        if row not in written_rows and not bool(
++                (rec[row] == RECORD_SENTINEL).all()):
++            fail(f"records row {row} (unwritten) was modified")
++    for row, steps in ref_records.items():
++        for j in range(MAX_MTP_WINDOW):
++            if j not in steps and not bool(
++                    (rec[row, :, j, :] == RECORD_SENTINEL).all()):
++                fail(f"records row {row} step {j} (unwritten) was modified")
++
++    state_b = state0.float().to(device).contiguous()
++    out_b = recurrent_gated_delta_rule_stock(
++        q_d, k_d, v_d, state_b, g=g_d, beta=beta_d, scale=scale,
++        actual_seq_lengths=csl, ssm_state_indices=idx,
++        num_accepted_tokens=acc)
++    torch.npu.synchronize()
++    if not bool((out == out_b).all()):
++        fail("recover out is not bitwise equal to the stock entry")
++    if not bool((state == state_b).all()):
++        fail("recover state is not bitwise equal to the stock entry")
++    _PROBE_PASSED = True
++
++
+ def workspace_report() -> dict:
+     """Post-run verification: sentinel rows intact, fallback counts, bytes."""
+     return {
+@@ -299,4 +554,6 @@ def workspace_report() -> dict:
+         "window": _RECORD_WINDOW,
+         "fallbacks": dict(FALLBACKS),
+         "calls": dict(CALLS),
++        "calls_by_phase": {k: dict(v) for k, v in CALLS_PHASE.items()},
++        "capability_probe_passed": _PROBE_PASSED,
+     }
+-- 
+2.34.1
+

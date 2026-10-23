@@ -1,0 +1,369 @@
+From f8256647d532c022d9d3bd3d0927e12885fa20e4 Mon Sep 17 00:00:00 2001
+From: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:54:31 +0000
+Subject: [PATCH 3/6] fix(gdn): drive the RGDR family through an R1-consistent
+ private aclnn runtime
+
+The R1 OPP carries only the RecurrentGatedDeltaRule family and shadows the
+wheel OPP's base-op host registration when it precedes the wheel OPP in
+ASCEND_CUSTOM_OPP_PATH (required for the recover op's bin lookup). A base-op
+launch through the wheel opapi or stable launcher then faults (507057,
+probed). With the flag on, both the verify (recover entry) and the plain
+decode (base entry) RGDR calls go through a private _AclnnRuntime whose
+custom library is the R1 libcust_opapi.so; conv/chunk ops keep the installed
+package's backends. Probe: recover and stock via the private runtime are
+bitwise identical to the wheel reference, records key bit-exact, sentinel
+intact (n10/N10_probe_recover.json).
+
+Signed-off-by: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/ops/gdn.py         |  16 ++-
+ vllm_ascend/ops/gdn_recover.py | 233 +++++++++++++++++++++++----------
+ 2 files changed, 175 insertions(+), 74 deletions(-)
+
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index f6df695..0a05029 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -413,6 +413,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+         self_kv_cache = self.kv_cache
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
++        # While the recover flag is on, the R1 OPP shadows the wheel's RGDR
++        # host registration, so every RGDR-family launch (verify AND plain
++        # decode) must go through the adapter's R1-consistent private runtime.
++        rgdr_op = (
++            gdn_recover.recurrent_gated_delta_rule_stock
++            if gdn_recover.recover_enabled()
++            else recurrent_gated_delta_rule
++        )
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+@@ -592,7 +600,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                     max_window=self.num_spec + 1,
+                 ).unsqueeze(0)
+             else:
+-                core_attn_out_spec = recurrent_gated_delta_rule(
++                core_attn_out_spec = rgdr_op(
+                     query_spec.squeeze(0),
+                     key_spec.squeeze(0),
+                     value_spec.squeeze(0),
+@@ -617,7 +625,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
+             query_decode = l2norm_fwd(query_decode)
+             key_decode = l2norm_fwd(key_decode)
+-            core_attn_out_decode = recurrent_gated_delta_rule(
++            core_attn_out_decode = rgdr_op(
+                 query_decode.squeeze(0),
+                 key_decode.squeeze(0),
+                 value_decode.squeeze(0),
+@@ -627,6 +635,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 scale=key_decode.shape[-1] ** -0.5,
+                 actual_seq_lengths=actual_seq_lengths,
+                 ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
++                num_accepted_tokens=None,
+             ).unsqueeze(0)
+         else:
+             core_attn_out_decode = None
+@@ -738,7 +747,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
+             query_non_spec = l2norm_fwd(query_non_spec)
+             key_non_spec = l2norm_fwd(key_non_spec)
+-            core_attn_out_non_spec = recurrent_gated_delta_rule(
++            core_attn_out_non_spec = rgdr_op(
+                 query_non_spec.squeeze(0),
+                 key_non_spec.squeeze(0),
+                 value_non_spec.squeeze(0),
+@@ -748,6 +757,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 scale=key_non_spec.shape[-1] ** -0.5,
+                 actual_seq_lengths=actual_seq_lengths,
+                 ssm_state_indices=non_spec_state_indices_tensor,
++                num_accepted_tokens=None,
+             ).unsqueeze(0)
+         else:
+             core_attn_out_non_spec, last_recurrent_state = None, None
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+index b359ece..597297d 100644
+--- a/vllm_ascend/ops/gdn_recover.py
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -4,13 +4,7 @@
+ 
+ Behind ``VLLM_ASCEND_GDN_RECOVER=1`` the pure-spec verify call in
+ ``vllm_ascend/ops/gdn.py`` is routed to the recover operator
+-(``aclnnRecurrentGatedDeltaRuleRecover``) instead of the stock
+-``recurrent_gated_delta_rule``.  The call goes through the installed
+-``fla_npu.ops.ascendc._runtime`` ctypes two-stage aclnn machinery; the recover
+-kernel binaries come from the operator's OPP build via
+-``ASCEND_CUSTOM_OPP_PATH``.  No Stable-ABI launcher is loaded, so the stock
+-``fla_npu`` backends (and their ``torch.ops.fla_npu_stable`` namespace) are
+-untouched.
++(``aclnnRecurrentGatedDeltaRuleRecover``) with a per-layer records workspace.
+ 
+ Contract notes (gdn recover operator, R1-fixed):
+   * ``source_state`` is left null: the call keeps the stock in-place read
+@@ -25,47 +19,193 @@ Contract notes (gdn recover operator, R1-fixed):
+   * ``num_accepted_tokens`` is clamped into [1, num_spec+1] before launch:
+     0/-1/>L are silent no-ops in the operator.
+ 
+-The recover aclnn entry is absent from the installed ``fla_npu`` package's
+-opapi, and the R1 OPP cannot share the CANN operator registry with the wheel
+-OPP in either precedence order (n5-first: the stock op's launch faults on the
+-host-side shadowing; wheel-first: the recover op's internal bin lookup for
+-``RecurrentGatedDeltaRule`` misses).  The recover arm therefore runs with the
+-n5 overlay package (``n5/pylib``) ahead of site-packages on PYTHONPATH, the
+-R1 Stable-ABI launcher via ``FLA_NPU_STABLE_LIB``, and the n5 OPP first in
+-``ASCEND_CUSTOM_OPP_PATH`` -- exactly the n9 environment.  Legacy-op kernels
+-in the n5 build are bit-identical to the wheel (n5 proof), so the remaining
+-arm difference besides the operator swap is the overlay's python glue; the
+-``stock_overlay`` control arm isolates that.
++OPP/opapi consistency (measured on 910B3, N10 probes): the R1 OPP carries
++only the RecurrentGatedDeltaRule family, and its host-side registration
++shadows the wheel OPP's definition of the base op when it precedes the wheel
++OPP in ``ASCEND_CUSTOM_OPP_PATH`` (required -- with the wheel first the
++recover op's internal bin lookup misses, and with the overlay python package
++that ordering even runs while writing wrong records).  A launch of the base
++op through the wheel's opapi/launcher then faults (507057).  Therefore, while
++the flag is on, BOTH RGDR-family aclnn entries (stock base op and recover)
++are driven through a private ``_AclnnRuntime`` whose custom library is the
++R1 build's ``libcust_opapi.so``; every other fla_npu operator (conv, chunk)
++is untouched and keeps the installed package's backends.
+ """
+ 
+ import ctypes
++import os
+ 
+ import torch
+ 
+ import vllm_ascend.envs as envs
+ 
+ ENTRY_NAME = "aclnnRecurrentGatedDeltaRuleRecover"
++STOCK_ENTRY_NAME = "aclnnRecurrentGatedDeltaRule"
+ MAX_MTP_WINDOW = 8
+ RECORD_SENTINEL = -777.0
+ 
++# libcust_opapi.so from the R1-fixed operator build; carries exactly the RGDR
++# family (base + recover).  Overridable for reproduction on another host.
++DEFAULT_RGDR_OPAPI = (
++    "/data1/f00538480/evaluation/ascend910/experiments/"
++    "gdn_recover_public_primitives_20261021/r0_20261021/n5/cann/vendors/"
++    "fla_npu_transformer/op_api/lib/libcust_opapi.so"
++)
++
+ 
+ def recover_enabled() -> bool:
+     return bool(envs.VLLM_ASCEND_GDN_RECOVER)
+ 
+ 
++_RGDR_RUNTIME = None
++
++
++def _rgdr_runtime():
++    """Private aclnn runtime for the RGDR family on the R1 opapi build.
++
++    Mirrors ``fla_npu.load_ascendc_opapi_libraries`` (custom-first lookup)
++    with the R1 libcust_opapi.so as the custom library; the installed
++    package's global runtime and backends are not touched.
++    """
++    global _RGDR_RUNTIME
++    if _RGDR_RUNTIME is not None:
++        return _RGDR_RUNTIME
++    import fla_npu
++    from fla_npu.ops.ascendc import _runtime as _rt
++
++    opapi = os.environ.get("FLA_NPU_RGDR_OPAPI", DEFAULT_RGDR_OPAPI)
++    libraries = [
++        fla_npu._load_shared_library_required(opapi),
++        fla_npu._load_shared_library_required("libopapi.so"),
++    ]
++    original = fla_npu.load_ascendc_opapi_libraries
++    fla_npu.load_ascendc_opapi_libraries = lambda: libraries
++    try:
++        runtime = _rt._AclnnRuntime()
++    finally:
++        fla_npu.load_ascendc_opapi_libraries = original
++    runtime.symbol(ENTRY_NAME + "GetWorkspaceSize")
++    _RGDR_RUNTIME = runtime
++    return runtime
++
++
+ def recover_available() -> bool:
+-    """Whether the recover aclnn entry resolves against the loaded opapi."""
++    """Whether the recover aclnn entry resolves against the R1 opapi build."""
+     if not recover_enabled():
+         return False
+     try:
+-        from fla_npu.ops.ascendc._runtime import runtime
+-
+-        runtime().symbol(ENTRY_NAME + "GetWorkspaceSize")
++        _rgdr_runtime()
+         return True
+     except Exception:
+         return False
+ 
+ 
++def _call_rgdr(entry, build, out):
++    from fla_npu.ops.ascendc._runtime import (
++        _CallContext,
++        _call_device,
++        _npu_device_guard,
++    )
++
++    aclnn_runtime = _rgdr_runtime()
++    device = _call_device((out,))
++    ctx = _CallContext(aclnn_runtime, device)
++    with _npu_device_guard(device):
++        try:
++            args = build(ctx)
++            aclnn_runtime.call(entry, args, device)
++        finally:
++            ctx.destroy()
++    return out
++
++
++def recurrent_gated_delta_rule_recover_verify(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    ssm_state: torch.Tensor,
++    *,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float,
++    actual_seq_lengths: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    num_accepted_tokens: torch.Tensor,
++    record_indices: torch.Tensor,
++    records: torch.Tensor,
++    max_window: int,
++) -> torch.Tensor:
++    """Recover-entry verify call; same out/state semantics as the stock op.
++
++    ``num_accepted_tokens`` is clamped to [1, max_window] (the operator treats
++    0/-1/>L as silent no-ops).  Returns the per-token output tensor.
++    """
++    num_accepted = num_accepted_tokens.to(torch.int32).clamp(1, max_window)
++    out = torch.empty_like(value)
++
++    def build(ctx):
++        return [
++            ctx.tensor(query, "query"),
++            ctx.tensor(key, "key"),
++            ctx.tensor(value, "value"),
++            ctx.tensor(beta, "beta"),
++            ctx.tensor(None, "source_state"),
++            ctx.tensor(ssm_state, "state"),
++            ctx.tensor(actual_seq_lengths, "actual_seq_lengths"),
++            ctx.tensor(ssm_state_indices, "ssm_state_indices"),
++            ctx.tensor(record_indices, "record_indices"),
++            ctx.tensor(g, "g"),
++            ctx.tensor(None, "gk"),
++            ctx.tensor(num_accepted, "num_accepted_tokens"),
++            ctypes.c_float(scale),
++            ctx.tensor(out, "out"),
++            ctx.tensor(records, "records"),
++        ]
++
++    return _call_rgdr(ENTRY_NAME, build, out)
++
++
++def recurrent_gated_delta_rule_stock(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    ssm_state: torch.Tensor,
++    *,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float,
++    actual_seq_lengths: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    num_accepted_tokens: torch.Tensor | None,
++) -> torch.Tensor:
++    """Stock base op through the same R1-consistent private runtime.
++
++    Used for the non-spec RGDR calls while the flag is on: with the R1 OPP
++    ahead of the wheel OPP in the registry, the base op must be launched
++    through the R1 opapi (the wheel opapi/launcher mismatches the shadowing
++    host registration and faults with 507057).
++    """
++    out = torch.empty_like(value)
++
++    def build(ctx):
++        return [
++            ctx.tensor(query, "query"),
++            ctx.tensor(key, "key"),
++            ctx.tensor(value, "value"),
++            ctx.tensor(beta, "beta"),
++            ctx.tensor(ssm_state, "state"),
++            ctx.tensor(actual_seq_lengths, "actual_seq_lengths"),
++            ctx.tensor(ssm_state_indices, "ssm_state_indices"),
++            ctx.tensor(g, "g"),
++            ctx.tensor(None, "gk"),
++            ctx.tensor(num_accepted_tokens, "num_accepted_tokens"),
++            ctypes.c_float(scale),
++            ctx.tensor(out, "out"),
++        ]
++
++    return _call_rgdr(STOCK_ENTRY_NAME, build, out)
++
++
+ # Allocated by the GDN attention metadata builder (one builder covers the GDN
+ # layer group) before any graph capture, and consumed read-only at the verify
+ # call site.  Module-level because the attention metadata object is shared
+@@ -156,52 +296,3 @@ def workspace_report() -> dict:
+         "window": _RECORD_WINDOW,
+         "fallbacks": dict(FALLBACKS),
+     }
+-
+-
+-def recurrent_gated_delta_rule_recover_verify(
+-    query: torch.Tensor,
+-    key: torch.Tensor,
+-    value: torch.Tensor,
+-    ssm_state: torch.Tensor,
+-    *,
+-    g: torch.Tensor,
+-    beta: torch.Tensor,
+-    scale: float,
+-    actual_seq_lengths: torch.Tensor,
+-    ssm_state_indices: torch.Tensor,
+-    num_accepted_tokens: torch.Tensor,
+-    record_indices: torch.Tensor,
+-    records: torch.Tensor,
+-    max_window: int,
+-) -> torch.Tensor:
+-    """Recover-entry verify call; same out/state semantics as the stock op.
+-
+-    ``num_accepted_tokens`` is clamped to [1, max_window] (the operator treats
+-    0/-1/>L as silent no-ops).  Returns the per-token output tensor.
+-    """
+-    from fla_npu.ops.ascendc._runtime import call_aclnn
+-
+-    num_accepted = num_accepted_tokens.to(torch.int32).clamp(1, max_window)
+-    out = torch.empty_like(value)
+-
+-    def build(ctx):
+-        return [
+-            ctx.tensor(query, "query"),
+-            ctx.tensor(key, "key"),
+-            ctx.tensor(value, "value"),
+-            ctx.tensor(beta, "beta"),
+-            ctx.tensor(None, "source_state"),
+-            ctx.tensor(ssm_state, "state"),
+-            ctx.tensor(actual_seq_lengths, "actual_seq_lengths"),
+-            ctx.tensor(ssm_state_indices, "ssm_state_indices"),
+-            ctx.tensor(record_indices, "record_indices"),
+-            ctx.tensor(g, "g"),
+-            ctx.tensor(None, "gk"),
+-            ctx.tensor(num_accepted, "num_accepted_tokens"),
+-            ctypes.c_float(scale),
+-            ctx.tensor(out, "out"),
+-            ctx.tensor(records, "records"),
+-        ]
+-
+-    call_aclnn(ENTRY_NAME, build, (out,))
+-    return out
+-- 
+2.34.1
+

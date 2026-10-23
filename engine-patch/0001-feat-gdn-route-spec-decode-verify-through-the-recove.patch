@@ -1,0 +1,356 @@
+From efb5edce3be9bacfece3035ed0ab73d1453f73d7 Mon Sep 17 00:00:00 2001
+From: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:00:06 +0000
+Subject: [PATCH 1/6] feat(gdn): route spec-decode verify through the recover
+ operator behind VLLM_ASCEND_GDN_RECOVER
+
+Experimental same-acceptance-trajectory A/B wiring (evaluation N10): with
+VLLM_ASCEND_GDN_RECOVER=1 the pure spec-decode verify call in gdn.py uses
+aclnnRecurrentGatedDeltaRuleRecover (via the installed fla_npu ctypes
+runtime; kernel binaries from ASCEND_CUSTOM_OPP_PATH) with a per-layer
+records workspace and per-token record indices. source_state stays null,
+keeping the stock in-place read semantics (bit-identical by design), so the
+R1-3 source/destination overlap rule does not apply. num_accepted_tokens is
+clamped to [1, num_spec+1]. Mixed batches and non-uniform windows fall back
+to the stock operator (counted in gdn_recover.FALLBACKS). Off by default;
+stock path is byte-identical.
+
+Signed-off-by: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/envs.py                 |   5 +
+ vllm_ascend/ops/gdn.py              |  55 ++++++--
+ vllm_ascend/ops/gdn_attn_builder.py |  19 +++
+ vllm_ascend/ops/gdn_recover.py      | 195 ++++++++++++++++++++++++++++
+ 4 files changed, 262 insertions(+), 12 deletions(-)
+ create mode 100644 vllm_ascend/ops/gdn_recover.py
+
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index ed5ae96..992d2e3 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -87,6 +87,11 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # (safe for Ascend 910B/A3). Set to a positive value to override when
+     # auto-detection is unavailable or for debugging UB overflow issues.
+     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
++    # Experimental: route the GDN spec-decode verify call through the recover
++    # operator (aclnnRecurrentGatedDeltaRuleRecover) with a per-layer records
++    # workspace. Default: 0 (disabled). Valid values: 0 or 1. Not sensitive.
++    # Requires ASCEND_CUSTOM_OPP_PATH to carry the recover kernel binaries.
++    "VLLM_ASCEND_GDN_RECOVER": lambda: os.getenv("VLLM_ASCEND_GDN_RECOVER", "0") == "1",
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 94eded2..f6df695 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -45,6 +45,7 @@ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+ from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
++from vllm_ascend.ops import gdn_recover
+ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+@@ -561,18 +562,48 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+             query_spec = l2norm_fwd(query_spec)
+             key_spec = l2norm_fwd(key_spec)
+-            core_attn_out_spec = recurrent_gated_delta_rule(
+-                query_spec.squeeze(0),
+-                key_spec.squeeze(0),
+-                value_spec.squeeze(0),
+-                ssm_state,
+-                g=g_spec.squeeze(0),
+-                beta=beta_spec.squeeze(0),
+-                scale=key_spec.shape[-1] ** -0.5,
+-                actual_seq_lengths=actual_seq_lengths,
+-                ssm_state_indices=spec_state_indices_tensor.flatten(),
+-                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+-            ).unsqueeze(0)
++            recover_records = None
++            recover_record_indices = None
++            if gdn_recover.recover_enabled():
++                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
++                    recover_records = gdn_recover.get_records_pool(self.prefix)
++                    if recover_records is None:
++                        gdn_recover.FALLBACKS["no_pool"] += 1
++                    else:
++                        recover_record_indices = gdn_recover.record_indices_for(
++                            query_spec.shape[1], spec_state_indices_tensor.shape[0]
++                        )
++                else:
++                    gdn_recover.FALLBACKS["mixed_batch"] += 1
++            if recover_records is not None and recover_record_indices is not None:
++                core_attn_out_spec = gdn_recover.recurrent_gated_delta_rule_recover_verify(
++                    query_spec.squeeze(0),
++                    key_spec.squeeze(0),
++                    value_spec.squeeze(0),
++                    ssm_state,
++                    g=g_spec.squeeze(0),
++                    beta=beta_spec.squeeze(0),
++                    scale=key_spec.shape[-1] ** -0.5,
++                    actual_seq_lengths=actual_seq_lengths,
++                    ssm_state_indices=spec_state_indices_tensor.flatten(),
++                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
++                    record_indices=recover_record_indices,
++                    records=recover_records,
++                    max_window=self.num_spec + 1,
++                ).unsqueeze(0)
++            else:
++                core_attn_out_spec = recurrent_gated_delta_rule(
++                    query_spec.squeeze(0),
++                    key_spec.squeeze(0),
++                    value_spec.squeeze(0),
++                    ssm_state,
++                    g=g_spec.squeeze(0),
++                    beta=beta_spec.squeeze(0),
++                    scale=key_spec.shape[-1] ** -0.5,
++                    actual_seq_lengths=actual_seq_lengths,
++                    ssm_state_indices=spec_state_indices_tensor.flatten(),
++                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
++                ).unsqueeze(0)
+         else:
+             core_attn_out_spec, last_recurrent_state = None, None
+ 
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index 48bc1a4..a4436cf 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
++from vllm_ascend.ops import gdn_recover
+ from vllm_ascend.ops.triton.fla.utils import (
+     prepare_chunk_indices,
+     prepare_chunk_offsets,
+@@ -394,6 +395,24 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+                 (sequence_index_capacity + 1,), dtype=torch.int32, device=device
+             )
+ 
++        # Experimental GDN recover wiring (VLLM_ASCEND_GDN_RECOVER): stable
++        # per-token records-row buffer (request ordinal = token // window for
++        # the uniform spec window) plus one records workspace per layer.
++        if gdn_recover.recover_enabled():
++            num_spec = getattr(
++                vllm_config.speculative_config, "num_speculative_tokens", 0
++            ) or 0
++            if num_spec > 0:
++                ssm_shape = kv_cache_spec.shapes[1]
++                assert len(ssm_shape) == 3, ssm_shape
++                gdn_recover.configure_workspace(
++                    layer_names=layer_names,
++                    request_capacity=sequence_index_capacity,
++                    window=num_spec + 1,
++                    ssm_state_shape=tuple(ssm_shape),
++                    device=device,
++                )
++
+     def _init_reorder_batch_threshold(
+         self,
+         reorder_batch_threshold: int | None = 1,
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+new file mode 100644
+index 0000000..e7c36b6
+--- /dev/null
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++"""Experimental GDN recover-operator wiring for the spec-decode verify path.
++
++Behind ``VLLM_ASCEND_GDN_RECOVER=1`` the pure-spec verify call in
++``vllm_ascend/ops/gdn.py`` is routed to the recover operator
++(``aclnnRecurrentGatedDeltaRuleRecover``) instead of the stock
++``recurrent_gated_delta_rule``.  The call goes through the installed
++``fla_npu.ops.ascendc._runtime`` ctypes two-stage aclnn machinery; the recover
++kernel binaries come from the operator's OPP build via
++``ASCEND_CUSTOM_OPP_PATH``.  No Stable-ABI launcher is loaded, so the stock
++``fla_npu`` backends (and their ``torch.ops.fla_npu_stable`` namespace) are
++untouched.
++
++Contract notes (gdn recover operator, R1-fixed):
++  * ``source_state`` is left null: the call keeps the stock in-place read
++    semantics, which the recover entry reproduces bit-for-bit, so the
++    read-row-in-write-window aliasing of the engine's slot reuse does not
++    apply (the R1-3 source/destination overlap rule only governs a provided
++    ``source_state``).
++  * ``records`` is a per-layer fp32 workspace ``[capacity, HV, 8, V+K+1]``
++    (dim 2 frozen at MAX_MTP=8); ``record_indices`` is an int32 per-token row
++    index (request ordinal within the verify call).  Records are written for
++    contract/verification only; the engine does not consume them.
++  * ``num_accepted_tokens`` is clamped into [1, num_spec+1] before launch:
++    0/-1/>L are silent no-ops in the operator.
++"""
++
++import ctypes
++
++import torch
++
++import vllm_ascend.envs as envs
++
++ENTRY_NAME = "aclnnRecurrentGatedDeltaRuleRecover"
++MAX_MTP_WINDOW = 8
++RECORD_SENTINEL = -777.0
++
++
++def recover_enabled() -> bool:
++    return bool(envs.VLLM_ASCEND_GDN_RECOVER)
++
++
++def recover_available() -> bool:
++    """Whether the recover aclnn entry resolves against the loaded opapi."""
++    if not recover_enabled():
++        return False
++    try:
++        from fla_npu.ops.ascendc._runtime import runtime
++
++        runtime().symbol(ENTRY_NAME + "GetWorkspaceSize")
++        return True
++    except Exception:
++        return False
++
++
++# Allocated by the GDN attention metadata builder (one builder covers the GDN
++# layer group) before any graph capture, and consumed read-only at the verify
++# call site.  Module-level because the attention metadata object is shared
++# across the layers of the group while the records workspaces are per layer.
++_RECORDS_POOLS: dict[str, torch.Tensor] = {}
++_RECORD_INDEX_BUFFER: torch.Tensor | None = None
++_RECORD_WINDOW: int = 0
++# Steps that stayed on the stock operator although the flag was on, by reason.
++FALLBACKS: dict[str, int] = {"no_pool": 0, "nonuniform_window": 0,
++                             "mixed_batch": 0}
++
++
++def configure_workspace(
++    *,
++    layer_names: list[str],
++    request_capacity: int,
++    window: int,
++    ssm_state_shape: tuple[int, ...],
++    device: torch.device,
++) -> None:
++    """Allocate the records workspaces and the per-token row-index buffer.
++
++    ``ssm_state_shape`` is the per-block temporal state shape (HV, V, K).
++    Each pool holds ``request_capacity`` usable rows plus one sentinel tail
++    row kept at RECORD_SENTINEL so a post-run check proves the operator never
++    wrote outside the leased rows.
++    """
++    global _RECORD_INDEX_BUFFER, _RECORD_WINDOW
++    num_v_heads, head_v_dim, head_k_dim = ssm_state_shape
++    for name in layer_names:
++        if name in _RECORDS_POOLS:
++            continue
++        pool = torch.full(
++            (request_capacity + 1, num_v_heads, MAX_MTP_WINDOW,
++             head_v_dim + head_k_dim + 1),
++            RECORD_SENTINEL,
++            dtype=torch.float32,
++            device=device,
++        )
++        pool[:request_capacity] = float("nan")
++        _RECORDS_POOLS[name] = pool
++    _RECORD_INDEX_BUFFER = (
++        torch.arange(
++            request_capacity * window, dtype=torch.int32, device=device
++        )
++        // window
++    )
++    _RECORD_WINDOW = window
++
++
++def get_records_pool(layer_name: str) -> torch.Tensor | None:
++    return _RECORDS_POOLS.get(layer_name)
++
++
++def record_indices_for(num_tokens: int, num_requests: int) -> torch.Tensor | None:
++    """Per-token records row (request ordinal) for a pure spec-decode batch.
++
++    Fast path: the window is uniform, so the precomputed buffer view is exact.
++    Non-uniform batches (a truncated final request) fall back to None and the
++    caller uses the stock operator for that step.
++    """
++    if (
++        _RECORD_INDEX_BUFFER is None
++        or num_tokens != num_requests * _RECORD_WINDOW
++        or num_tokens > _RECORD_INDEX_BUFFER.numel()
++    ):
++        FALLBACKS["nonuniform_window"] += 1
++        return None
++    return _RECORD_INDEX_BUFFER[:num_tokens]
++
++
++def records_sentinel_ok(pool: torch.Tensor) -> bool:
++    return bool((pool[-1] == RECORD_SENTINEL).all())
++
++
++def workspace_report() -> dict:
++    """Post-run verification: sentinel rows intact, fallback counts, bytes."""
++    return {
++        "pools": {
++            name: {
++                "shape": list(pool.shape),
++                "sentinel_ok": records_sentinel_ok(pool),
++            }
++            for name, pool in _RECORDS_POOLS.items()
++        },
++        "pool_bytes_total": sum(p.numel() * p.element_size()
++                                for p in _RECORDS_POOLS.values()),
++        "window": _RECORD_WINDOW,
++        "fallbacks": dict(FALLBACKS),
++    }
++
++
++def recurrent_gated_delta_rule_recover_verify(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    ssm_state: torch.Tensor,
++    *,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float,
++    actual_seq_lengths: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    num_accepted_tokens: torch.Tensor,
++    record_indices: torch.Tensor,
++    records: torch.Tensor,
++    max_window: int,
++) -> torch.Tensor:
++    """Recover-entry verify call; same out/state semantics as the stock op.
++
++    ``num_accepted_tokens`` is clamped to [1, max_window] (the operator treats
++    0/-1/>L as silent no-ops).  Returns the per-token output tensor.
++    """
++    from fla_npu.ops.ascendc._runtime import call_aclnn
++
++    num_accepted = num_accepted_tokens.to(torch.int32).clamp(1, max_window)
++    out = torch.empty_like(value)
++
++    def build(ctx):
++        return [
++            ctx.tensor(query, "query"),
++            ctx.tensor(key, "key"),
++            ctx.tensor(value, "value"),
++            ctx.tensor(beta, "beta"),
++            ctx.tensor(None, "source_state"),
++            ctx.tensor(ssm_state, "state"),
++            ctx.tensor(actual_seq_lengths, "actual_seq_lengths"),
++            ctx.tensor(ssm_state_indices, "ssm_state_indices"),
++            ctx.tensor(record_indices, "record_indices"),
++            ctx.tensor(g, "g"),
++            ctx.tensor(None, "gk"),
++            ctx.tensor(num_accepted, "num_accepted_tokens"),
++            ctypes.c_float(scale),
++            ctx.tensor(out, "out"),
++            ctx.tensor(records, "records"),
++        ]
++
++    call_aclnn(ENTRY_NAME, build, (out,))
++    return out
+-- 
+2.34.1
+

@@ -1,0 +1,43 @@
+From ddb0a810fec2e5fe8e4ef1b108237a8d195f3d19 Mon Sep 17 00:00:00 2001
+From: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:58:49 +0000
+Subject: [PATCH 4/6] test(gdn): count private-runtime RGDR launches by entry
+
+workspace_report() now includes per-entry launch counts so the A/B evidence
+can prove the recover entry actually executed in the worker process.
+
+Signed-off-by: curnane-lab <227407786+curnane-lab@users.noreply.github.com>
+---
+ vllm_ascend/ops/gdn_recover.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm_ascend/ops/gdn_recover.py b/vllm_ascend/ops/gdn_recover.py
+index 597297d..4533c78 100644
+--- a/vllm_ascend/ops/gdn_recover.py
++++ b/vllm_ascend/ops/gdn_recover.py
+@@ -108,6 +108,7 @@ def _call_rgdr(entry, build, out):
+     )
+ 
+     aclnn_runtime = _rgdr_runtime()
++    CALLS[entry] += 1
+     device = _call_device((out,))
+     ctx = _CallContext(aclnn_runtime, device)
+     with _npu_device_guard(device):
+@@ -216,6 +217,8 @@ _RECORD_WINDOW: int = 0
+ # Steps that stayed on the stock operator although the flag was on, by reason.
+ FALLBACKS: dict[str, int] = {"no_pool": 0, "nonuniform_window": 0,
+                              "mixed_batch": 0}
++# Launch counts through the private runtime, by entry (proof of execution).
++CALLS: dict[str, int] = {ENTRY_NAME: 0, STOCK_ENTRY_NAME: 0}
+ 
+ 
+ def configure_workspace(
+@@ -295,4 +298,5 @@ def workspace_report() -> dict:
+                                 for p in _RECORDS_POOLS.values()),
+         "window": _RECORD_WINDOW,
+         "fallbacks": dict(FALLBACKS),
++        "calls": dict(CALLS),
+     }
+-- 
+2.34.1
+
